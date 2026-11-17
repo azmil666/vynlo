@@ -1,13 +1,44 @@
 import os
 import shutil
+from typing import Any
 
 import boto3
 
 from app.config import settings
 
+_s3_client: Any | None = None
+_storage_handler: Any | None = None
 
-def upload_clip(file_path: str, object_key: str) -> str:
+
+def get_s3_client() -> Any | None:
+    return _s3_client
+
+
+def set_s3_client(client: Any | None) -> None:
+    global _s3_client
+    _s3_client = client
+
+
+def get_storage_handler() -> Any | None:
+    return _storage_handler
+
+
+def set_storage_handler(handler: Any | None) -> None:
+    global _storage_handler
+    _storage_handler = handler
+
+
+def upload_clip(
+    file_path: str,
+    object_key: str,
+    s3_client: Any | None = None,
+    storage_handler: Any | None = None,
+) -> str:
     """Upload rendered clip to S3/Cloudflare R2 or persist to local static directory."""
+    active_handler = storage_handler if storage_handler is not None else get_storage_handler()
+    if active_handler is not None:
+        return active_handler(file_path, object_key)
+
     clean_key = object_key.lstrip("/")
 
     is_s3_configured = bool(
@@ -18,14 +49,16 @@ def upload_clip(file_path: str, object_key: str) -> str:
     )
 
     if is_s3_configured:
-        s3_client = boto3.client(
-            "s3",
-            endpoint_url=settings.S3_ENDPOINT_URL,
-            aws_access_key_id=settings.S3_ACCESS_KEY,
-            aws_secret_access_key=settings.S3_SECRET_KEY,
-        )
+        client = s3_client if s3_client is not None else get_s3_client()
+        if client is None:
+            client = boto3.client(
+                "s3",
+                endpoint_url=settings.S3_ENDPOINT_URL,
+                aws_access_key_id=settings.S3_ACCESS_KEY,
+                aws_secret_access_key=settings.S3_SECRET_KEY,
+            )
 
-        s3_client.upload_file(
+        client.upload_file(
             file_path,
             settings.S3_BUCKET_NAME,
             clean_key,

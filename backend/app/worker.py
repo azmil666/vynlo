@@ -28,6 +28,25 @@ celery_app.conf.update(
     enable_utc=True,
 )
 
+_redis_client = None
+
+
+def get_redis_client() -> redis.Redis:
+    global _redis_client, redis_client
+    if _redis_client is not None:
+        return _redis_client
+    if redis_client is not None:
+        return redis_client
+    _redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    return _redis_client
+
+
+def set_redis_client(client: redis.Redis | None) -> None:
+    global _redis_client, redis_client
+    _redis_client = client
+    redis_client = client
+
+
 redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
 
 
@@ -48,14 +67,15 @@ def process_video_task(self, job_id: str, options: dict) -> None:
         clips: list[dict] | None = None,
         error: str | None = None,
     ) -> None:
+        r = get_redis_client()
         job_key = f"job:{job_id}"
-        ttl = redis_client.ttl(job_key)
+        ttl = r.ttl(job_key)
         if ttl is None or ttl <= 0:
             ttl = 86400
 
         current_clips: list[dict] = []
         current_error: str | None = None
-        existing_raw = redis_client.get(job_key)
+        existing_raw = r.get(job_key)
         if existing_raw:
             try:
                 existing_data = json.loads(existing_raw)
@@ -71,7 +91,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             error=error if error is not None else current_error,
             clips=clips if clips is not None else current_clips,
         )
-        redis_client.set(job_key, state.model_dump_json(), ex=ttl)
+        r.set(job_key, state.model_dump_json(), ex=ttl)
 
     work_dir = os.path.join(settings.TEMP_DIR, job_id)
     os.makedirs(work_dir, exist_ok=True)
@@ -92,11 +112,12 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
             video_id = f"url:{url_hash}"
 
+        r = get_redis_client()
         transcript_cache_key = f"cache:transcript:{video_id}"
         candidates_cache_key = f"cache:candidates:{video_id}"
 
         # 2. Check Redis for cached transcript
-        cached_words_raw = redis_client.get(transcript_cache_key)
+        cached_words_raw = r.get(transcript_cache_key)
         has_cached_transcript = cached_words_raw is not None
 
         # 3. Download media: skip audio extraction if transcript is already cached
@@ -114,11 +135,11 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             if not audio_path:
                 _, audio_path = download_media(url, work_dir, extract_audio=True)
             words = transcribe_audio(audio_path)
-            redis_client.set(transcript_cache_key, json.dumps(words), ex=604800)
+            r.set(transcript_cache_key, json.dumps(words), ex=604800)
 
         # 5. Viral analysis or load cached candidates
         update_job_state("analyzing", 50)
-        cached_candidates_raw = redis_client.get(candidates_cache_key)
+        cached_candidates_raw = r.get(candidates_cache_key)
         cached_candidates = None
         if cached_candidates_raw:
             try:
@@ -138,7 +159,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             candidates = find_viral_clips(words, max_clips=max_clips)
             has_fallback = any(c.get("is_fallback") for c in candidates)
             if not has_fallback:
-                redis_client.set(candidates_cache_key, json.dumps(candidates), ex=604800)
+                r.set(candidates_cache_key, json.dumps(candidates), ex=604800)
             else:
                 logger.info(
                     "Skipping candidate caching for %s: candidates contain fallback clips",

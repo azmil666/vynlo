@@ -1,0 +1,16 @@
+[
+  {"word": "First", "start": 1.00, "end": 1.35},
+  {"word": "section", "start": 1.40, "end": 1.85},
+  {"word": "starts", "start": 1.90, "end": 2.25},
+  {"word": "here.", "start": 2.30, "end": 2.70},
+  {"word": "Now", "start": 5.00, "end": 5.25},
+  {"word": "comes", "start": 5.30, "end": 5.60},
+  {"word": "the", "start": 5.65, "end": 5.75},
+  {"word": "second", "start": 5.80, "end": 6.20},
+  {"word": "part.", "start": 6.25, "end": 6.65},
+  {"word": "Finally", "start": 10.00, "end": 10.45},
+  {"word": "the", "start": 10.50, "end": 10.60},
+  {"word": "third", "start": 10.65, "end": 10.95},
+  {"word": "section", "start": 11.00, "end": 11.45},
+  {"word": "appears.", "start": 11.50, "end": 11.95}
+]

@@ -177,8 +177,37 @@ def _dedupe_non_overlapping(clips: list[dict], max_clips: int) -> list[dict]:
     return selected
 
 
-def _call_llm(system_instruction: str, user_content: str) -> str:
-    """Invoke either Gemini or OpenAI-compatible provider based on configuration."""
+_llm_client: Any | None = None
+
+
+def get_llm_client() -> Any | None:
+    return _llm_client
+
+
+def set_llm_client(client: Any | None) -> None:
+    global _llm_client
+    _llm_client = client
+
+
+def _call_llm(
+    system_instruction: str,
+    user_content: str,
+    llm_client: Any | None = None,
+) -> str:
+    """Invoke either Gemini, OpenAI, or an injected FakeLLM client."""
+    active_client = llm_client if llm_client is not None else get_llm_client()
+    if active_client is not None:
+        if hasattr(active_client, "generate"):
+            return active_client.generate(system_instruction, user_content)
+        if callable(active_client):
+            return active_client(system_instruction, user_content)
+        if hasattr(active_client, "models") and hasattr(active_client.models, "generate_content"):
+            res = active_client.models.generate_content(
+                model=getattr(settings, "GEMINI_MODEL", "") or settings.LLM_MODEL,
+                contents=user_content,
+            )
+            return getattr(res, "text", "") or "{}"
+
     model_name = getattr(settings, "GEMINI_MODEL", "") or settings.LLM_MODEL
     model_name_lower = model_name.lower()
 
@@ -219,7 +248,9 @@ def _call_llm(system_instruction: str, user_content: str) -> str:
         raise
 
 
-def _analyze_transcript_segment(words_slice: list[dict], max_clips: int = 3) -> list[dict]:
+def _analyze_transcript_segment(
+    words_slice: list[dict], max_clips: int = 3, llm_client: Any | None = None
+) -> list[dict]:
     """Analyze a single transcript window using the LLM."""
     if not words_slice:
         return []
@@ -252,7 +283,7 @@ def _analyze_transcript_segment(words_slice: list[dict], max_clips: int = 3) -> 
 
     raw_json = "{}"
     try:
-        raw_json = _call_llm(system_instruction, user_content)
+        raw_json = _call_llm(system_instruction, user_content, llm_client=llm_client)
     except Exception as e:
         logger.warning("LLM segment analysis error: %s", e)
 
@@ -308,7 +339,9 @@ def _analyze_transcript_segment(words_slice: list[dict], max_clips: int = 3) -> 
     return parsed_clips[:max_clips]
 
 
-def _rank_and_dedupe_clips(candidates: list[dict], max_clips: int) -> list[dict]:
+def _rank_and_dedupe_clips(
+    candidates: list[dict], max_clips: int, llm_client: Any | None = None
+) -> list[dict]:
     """Reduce pass: rank and deduplicate pooled candidate clips from multiple windows."""
     if not candidates:
         return []
@@ -341,7 +374,7 @@ def _rank_and_dedupe_clips(candidates: list[dict], max_clips: int) -> list[dict]
     )
 
     try:
-        raw_json = _call_llm(system_instruction, user_content)
+        raw_json = _call_llm(system_instruction, user_content, llm_client=llm_client)
         data = json.loads(raw_json)
         raw_clips = data.get("clips", []) if isinstance(data, dict) else []
         parsed = []
@@ -494,7 +527,9 @@ def _generate_fallback_segments(
     return clips[:max_clips]
 
 
-def find_viral_clips(words: list[dict], max_clips: int = 3) -> list[dict]:
+def find_viral_clips(
+    words: list[dict], max_clips: int = 3, llm_client: Any | None = None
+) -> list[dict]:
     """Analyze transcript with LLM (using Map-Reduce for >15min videos) and snap boundaries."""
     if not words:
         return [
@@ -532,7 +567,7 @@ def find_viral_clips(words: list[dict], max_clips: int = 3) -> list[dict]:
 
             if len(window_words) >= 5:
                 window_clips = _analyze_transcript_segment(
-                    window_words, max_clips=max_clips
+                    window_words, max_clips=max_clips, llm_client=llm_client
                 )
                 pooled_candidates.extend(window_clips)
 
@@ -541,12 +576,12 @@ def find_viral_clips(words: list[dict], max_clips: int = 3) -> list[dict]:
                 break
 
         selected_candidates = _rank_and_dedupe_clips(
-            pooled_candidates, max_clips=max_clips
+            pooled_candidates, max_clips=max_clips, llm_client=llm_client
         )
     else:
         # Standard video (<= 15 min): Analyze full compressed transcript in one pass
         selected_candidates = _analyze_transcript_segment(
-            words, max_clips=max_clips
+            words, max_clips=max_clips, llm_client=llm_client
         )
 
     # Apply sentence & silence boundary snapping to each selected clip

@@ -15,7 +15,12 @@ from app.config import settings
 from app.schemas import JobCreateRequest, JobStatusResponse
 from app.worker import process_video_task
 
-os.makedirs(settings.STATIC_DIR, exist_ok=True)
+try:
+    os.makedirs(settings.STATIC_DIR, exist_ok=True)
+except OSError:
+    fallback_static = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "static"))
+    os.makedirs(fallback_static, exist_ok=True)
+    settings.STATIC_DIR = fallback_static
 
 app = FastAPI(title="Clipper MVP API")
 
@@ -28,6 +33,25 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory=settings.STATIC_DIR), name="static")
+
+_redis_client = None
+
+
+def get_redis_client() -> redis.Redis:
+    global _redis_client, redis_client
+    if _redis_client is not None:
+        return _redis_client
+    if redis_client is not None:
+        return redis_client
+    _redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    return _redis_client
+
+
+def set_redis_client(client: redis.Redis | None) -> None:
+    global _redis_client, redis_client
+    _redis_client = client
+    redis_client = client
+
 
 redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
 
@@ -43,14 +67,14 @@ def _slugify(text: str) -> str:
 def create_job(req: JobCreateRequest):
     job_id = str(uuid4())
     initial_status = JobStatusResponse(job_id=job_id, status="queued", progress=0)
-    redis_client.set(f"job:{job_id}", initial_status.model_dump_json(), ex=86400)
+    get_redis_client().set(f"job:{job_id}", initial_status.model_dump_json(), ex=86400)
     process_video_task.delay(job_id, req.model_dump(mode="json"))
     return initial_status
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)
 def get_job_status(job_id: str):
-    data = redis_client.get(f"job:{job_id}")
+    data = get_redis_client().get(f"job:{job_id}")
     if not data:
         raise HTTPException(status_code=404, detail="Job not found")
     return JobStatusResponse.model_validate_json(data)
@@ -59,7 +83,7 @@ def get_job_status(job_id: str):
 @app.get("/api/jobs/{job_id}/download-all")
 def download_all_clips(job_id: str):
     """Bundle all generated clips and captions into a single zip archive for batch download."""
-    data = redis_client.get(f"job:{job_id}")
+    data = get_redis_client().get(f"job:{job_id}")
     if not data:
         raise HTTPException(status_code=404, detail="Job not found")
 
