@@ -17,5 +17,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ./app ./app
 
-RUN mkdir -p /app/static /tmp/clipper /app/models \
-    && curl -fsSL https://raw.githubusercontent.com/opencv/opencv/4.x/data/haarcascades/haarcascade_frontalface_default.xml -o /app/models/haarcascade_frontalface_default.xml
+RUN mkdir -p /app/static /tmp/clipper /app/models && \
+    curl -fsSL https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx \
+    -o /app/models/face_detection_yunet_2023mar.onnx
