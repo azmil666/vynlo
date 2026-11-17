@@ -1,10 +1,47 @@
 import os
 import subprocess
-from typing import Any
+import urllib.request
+from typing import Optional
 
 import cv2
-import mediapipe as mp
 import numpy as np
+
+
+def _get_face_cascade() -> Optional[cv2.CascadeClassifier]:
+    """Load or download Haar cascade XML for face detection."""
+    xml_path = None
+
+    if hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades"):
+        candidate = os.path.join(
+            cv2.data.haarcascades, "haarcascade_frontalface_default.xml"
+        )
+        if os.path.exists(candidate):
+            xml_path = candidate
+
+    if not xml_path:
+        tmp_cascade = "/tmp/haarcascade_frontalface_default.xml"
+        if not os.path.exists(tmp_cascade):
+            try:
+                urllib.request.urlretrieve(
+                    "https://raw.githubusercontent.com/opencv/opencv/4.x/data/haarcascades/haarcascade_frontalface_default.xml",
+                    tmp_cascade,
+                )
+            except Exception:
+                pass
+
+        if os.path.exists(tmp_cascade):
+            xml_path = tmp_cascade
+
+    if not xml_path:
+        return None
+
+    try:
+        cascade = cv2.CascadeClassifier(xml_path)
+        if cascade.empty():
+            return None
+        return cascade
+    except Exception:
+        return None
 
 
 def crop_to_vertical(
@@ -99,7 +136,7 @@ def crop_to_vertical(
             )
 
         else:
-            # Speaker mode: Face detection with MediaPipe and smart horizontal crop
+            # Speaker mode: Face detection with OpenCV Haar Cascade and smart horizontal crop
             crop_w = int(frame_h * 9 / 16)
             crop_w = crop_w - (crop_w % 2)
 
@@ -129,14 +166,13 @@ def crop_to_vertical(
                     stderr=subprocess.PIPE,
                 )
             else:
-                cap = cv2.VideoCapture(temp_slice)
-                frame_count = 0
                 face_centers_x: list[float] = []
+                face_cascade = _get_face_cascade()
 
-                mp_face_detection = mp.solutions.face_detection
-                with mp_face_detection.FaceDetection(
-                    model_selection=1, min_detection_confidence=0.5
-                ) as face_detector:
+                if face_cascade is not None:
+                    cap = cv2.VideoCapture(temp_slice)
+                    frame_count = 0
+
                     while cap.isOpened():
                         ret, frame = cap.read()
                         if not ret:
@@ -145,20 +181,22 @@ def crop_to_vertical(
                         if frame_count % 5 != 0:
                             continue
 
-                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        results: Any = face_detector.process(rgb_frame)
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        faces = face_cascade.detectMultiScale(
+                            gray,
+                            scaleFactor=1.1,
+                            minNeighbors=5,
+                            minSize=(40, 40),
+                        )
 
-                        if results.detections:
-                            # Select highest confidence or largest face detection
-                            best_detection = max(
-                                results.detections,
-                                key=lambda d: d.score[0] if d.score else 0.0,
-                            )
-                            bbox = best_detection.location_data.relative_bounding_box
-                            center_x = bbox.xmin + bbox.width / 2.0
+                        if len(faces) > 0:
+                            # Pick the largest face by area (w * h)
+                            largest_face = max(faces, key=lambda f: f[2] * f[3])
+                            x, y, w, h = largest_face
+                            center_x = (float(x) + float(w) / 2.0) / frame_w
                             face_centers_x.append(center_x)
 
-                cap.release()
+                    cap.release()
 
                 median_center_x = (
                     float(np.median(face_centers_x)) if face_centers_x else 0.5
