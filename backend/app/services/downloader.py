@@ -48,7 +48,7 @@ def download_media(
     audio_path = os.path.join(output_dir, "audio.wav") if extract_audio else None
 
     ydl_opts: dict[str, Any] = {
-        "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[ext=mp4]/best",
+        "format": "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4][vcodec!=av01][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][vcodec!=av01]/best",
         "outtmpl": os.path.join(output_dir, "source.%(ext)s"),
         "merge_output_format": "mp4",
         "noplaylist": True,

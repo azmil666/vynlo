@@ -126,12 +126,24 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             except Exception:
                 cached_candidates = None
 
-        if cached_candidates and len(cached_candidates) >= max_clips:
+        if (
+            cached_candidates
+            and isinstance(cached_candidates, list)
+            and len(cached_candidates) >= max_clips
+            and not any(c.get("is_fallback") for c in cached_candidates)
+        ):
             logger.info("Using cached candidates for %s (found %d)", video_id, len(cached_candidates))
             candidates = cached_candidates[:max_clips]
         else:
             candidates = find_viral_clips(words, max_clips=max_clips)
-            redis_client.set(candidates_cache_key, json.dumps(candidates), ex=604800)
+            has_fallback = any(c.get("is_fallback") for c in candidates)
+            if not has_fallback:
+                redis_client.set(candidates_cache_key, json.dumps(candidates), ex=604800)
+            else:
+                logger.info(
+                    "Skipping candidate caching for %s: candidates contain fallback clips",
+                    video_id,
+                )
 
         completed_clips: list[dict] = []
         total_candidates = len(candidates)

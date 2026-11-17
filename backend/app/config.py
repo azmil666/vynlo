@@ -7,7 +7,8 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://redis:6379/0"
     LLM_API_KEY: str = ""
-    LLM_MODEL: str = "gemini-2.5-flash"
+    LLM_MODEL: str = "gemini-3.8-flash"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
     TEMP_DIR: str = "/tmp/clipper"
     STATIC_DIR: str = "/app/static"
     PUBLIC_BASE_URL: str = "http://localhost:8000"

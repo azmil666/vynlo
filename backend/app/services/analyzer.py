@@ -179,39 +179,44 @@ def _dedupe_non_overlapping(clips: list[dict], max_clips: int) -> list[dict]:
 
 def _call_llm(system_instruction: str, user_content: str) -> str:
     """Invoke either Gemini or OpenAI-compatible provider based on configuration."""
-    model_name = settings.LLM_MODEL.lower()
+    model_name = getattr(settings, "GEMINI_MODEL", "") or settings.LLM_MODEL
+    model_name_lower = model_name.lower()
 
-    if "gemini" in model_name:
-        from google import genai
-        from google.genai import types
+    try:
+        if "gemini" in model_name_lower:
+            from google import genai
+            from google.genai import types
 
-        client = genai.Client(api_key=settings.LLM_API_KEY)
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_schema=ClipAnalysisResponse,
-            temperature=0.3,
-        )
-        response = client.models.generate_content(
-            model=settings.LLM_MODEL,
-            contents=user_content,
-            config=config,
-        )
-        return response.text or "{}"
-    else:
-        from openai import OpenAI
+            client = genai.Client(api_key=settings.LLM_API_KEY)
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                response_schema=ClipAnalysisResponse,
+                temperature=0.3,
+            )
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_content,
+                config=config,
+            )
+            return response.text or "{}"
+        else:
+            from openai import OpenAI
 
-        client = OpenAI(api_key=settings.LLM_API_KEY)
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_content},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.3,
-        )
-        return response.choices[0].message.content or "{}"
+            client = OpenAI(api_key=settings.LLM_API_KEY)
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_content},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3,
+            )
+            return response.choices[0].message.content or "{}"
+    except Exception:
+        logger.exception("LLM viral clip analysis failed")
+        raise
 
 
 def _analyze_transcript_segment(words_slice: list[dict], max_clips: int = 3) -> list[dict]:
@@ -370,6 +375,125 @@ def _rank_and_dedupe_clips(candidates: list[dict], max_clips: int) -> list[dict]
     return _dedupe_non_overlapping(candidates, max_clips)
 
 
+def _generate_fallback_segments(
+    words: list[dict],
+    min_start: float,
+    total_duration: float,
+    max_clips: int,
+    existing_clips: list[dict] | None = None,
+) -> list[dict]:
+    """Generate non-overlapping fallback clips evenly spaced across video duration."""
+    content_dur = max(0.0, total_duration - min_start)
+    clips: list[dict] = list(existing_clips or [])
+
+    if content_dur <= 90.0:
+        if not clips:
+            fallback_duration = min(45.0, max(5.0, content_dur))
+            fallback_end = min_start + fallback_duration
+            if fallback_end <= min_start:
+                fallback_end = total_duration
+            snapped_start, snapped_end = _snap_boundaries(min_start, fallback_end, words)
+            clips.append(
+                {
+                    "start_time": snapped_start,
+                    "end_time": snapped_end,
+                    "title": "Engaging Highlight",
+                    "virality_score": 85,
+                    "description": "Watch this engaging moment extracted from the stream.",
+                    "hashtags": ["shorts", "viral", "clips"],
+                    "is_fallback": True,
+                }
+            )
+        return clips
+
+    # For videos > 90s, generate evenly spaced segments (e.g. 15%, 50%, 80% for 3 clips)
+    if max_clips == 1:
+        fractions = [0.25]
+    elif max_clips == 2:
+        fractions = [0.20, 0.70]
+    elif max_clips == 3:
+        fractions = [0.15, 0.50, 0.80]
+    else:
+        fractions = [round((i + 0.5) / max_clips, 2) for i in range(max_clips)]
+
+    target_duration = 35.0
+
+    for frac in fractions:
+        if len(clips) >= max_clips:
+            break
+        raw_start = min_start + frac * content_dur
+        raw_end = min(total_duration, raw_start + target_duration)
+        if (raw_end - raw_start) < 20.0 and (raw_start - target_duration >= min_start):
+            raw_start = max(min_start, raw_end - target_duration)
+
+        snapped_start, snapped_end = _snap_boundaries(raw_start, raw_end, words)
+        if (snapped_end - snapped_start) < 5.0:
+            continue
+
+        overlaps = any(
+            (snapped_start < c["end_time"] and snapped_end > c["start_time"])
+            for c in clips
+        )
+        if not overlaps:
+            clip_idx = len(clips) + 1
+            clips.append(
+                {
+                    "start_time": snapped_start,
+                    "end_time": snapped_end,
+                    "title": f"Highlight {clip_idx}",
+                    "virality_score": max(65, 85 - (clip_idx - 1) * 5),
+                    "description": "Watch this engaging moment extracted from the stream.",
+                    "hashtags": ["shorts", "viral", "clips"],
+                    "is_fallback": True,
+                }
+            )
+
+    # If still fewer than max_clips (e.g. due to snapping overlaps), step through timeline
+    if len(clips) < max_clips:
+        step = max(30.0, (content_dur - target_duration) / (max_clips * 2))
+        curr = min_start
+        while curr + 15.0 < total_duration and len(clips) < max_clips:
+            c_end = min(total_duration, curr + target_duration)
+            s_start, s_end = _snap_boundaries(curr, c_end, words)
+            if (s_end - s_start) >= 5.0:
+                overlaps = any(
+                    (s_start < c["end_time"] and s_end > c["start_time"])
+                    for c in clips
+                )
+                if not overlaps:
+                    clip_idx = len(clips) + 1
+                    clips.append(
+                        {
+                            "start_time": s_start,
+                            "end_time": s_end,
+                            "title": f"Highlight {clip_idx}",
+                            "virality_score": max(60, 80 - (clip_idx - 1) * 5),
+                            "description": "Watch this engaging moment extracted from the stream.",
+                            "hashtags": ["shorts", "viral", "clips"],
+                            "is_fallback": True,
+                        }
+                    )
+            curr += step
+
+    if not clips:
+        fallback_dur = min(45.0, max(5.0, content_dur))
+        s_start, s_end = _snap_boundaries(min_start, min_start + fallback_dur, words)
+        clips.append(
+            {
+                "start_time": s_start,
+                "end_time": s_end,
+                "title": "Engaging Highlight",
+                "virality_score": 85,
+                "description": "Watch this engaging moment extracted from the stream.",
+                "hashtags": ["shorts", "viral", "clips"],
+                "is_fallback": True,
+            }
+        )
+
+    clips.sort(key=lambda x: x["start_time"])
+    return clips[:max_clips]
+
+
 def find_viral_clips(words: list[dict], max_clips: int = 3) -> list[dict]:
     """Analyze transcript with LLM (using Map-Reduce for >15min videos) and snap boundaries."""
     if not words:
@@ -449,26 +573,10 @@ def find_viral_clips(words: list[dict], max_clips: int = 3) -> list[dict]:
             }
         )
 
-    # Safe fallback if zero valid clips returned
-    if not valid_clips:
-        fallback_duration = min(45.0, total_duration - min_start)
-        fallback_end = min_start + fallback_duration
-        if fallback_end <= min_start:
-            fallback_end = total_duration
-
-        snapped_start, snapped_end = _snap_boundaries(
-            min_start, fallback_end, words
+    # Safe fallback if fewer than max_clips returned
+    if len(valid_clips) < max_clips:
+        valid_clips = _generate_fallback_segments(
+            words, min_start, total_duration, max_clips, existing_clips=valid_clips
         )
-        valid_clips = [
-            {
-                "start_time": snapped_start,
-                "end_time": snapped_end,
-                "title": "Engaging Highlight",
-                "virality_score": 85,
-                "description": "Watch this engaging moment extracted from the stream.",
-                "hashtags": ["shorts", "viral", "clips"],
-                "is_fallback": True,
-            }
-        ]
 
     return valid_clips
