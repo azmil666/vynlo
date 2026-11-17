@@ -1,18 +1,29 @@
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import os
 import shutil
+from typing import Any
 
 from celery import Celery
+import cv2
 import redis
 
 from app.config import settings
-from app.schemas import JobStatusResponse
+from app.schemas import (
+    ClipResult,
+    JobErrorDetail,
+    JobStatusResponse,
+    JobWarning,
+    PipelineError,
+    PipelineErrorCode,
+    map_exception_to_pipeline_error,
+)
 from app.services.downloader import download_media, get_video_metadata
 from app.services.transcriber import transcribe_audio
 from app.services.analyzer import find_viral_clips
-from app.services.cropper import compute_crop_filter
+from app.services.cropper import _get_face_detector, compute_crop_filter
 from app.services.captions import generate_ass_subtitles, render_clip_single_pass
 from app.services.storage import upload_clip
 
@@ -61,12 +72,18 @@ redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
     acks_late=True,
 )
 def process_video_task(self, job_id: str, options: dict) -> None:
+    current_stage = "queued"
+    warnings_list: list[dict] = []
+
     def update_job_state(
-        status: str,
+        stage: str,
         progress: int,
         clips: list[dict] | None = None,
-        error: str | None = None,
+        error: Any | None = None,
+        warnings: list[dict] | None = None,
     ) -> None:
+        nonlocal current_stage
+        current_stage = stage
         r = get_redis_client()
         job_key = f"job:{job_id}"
         ttl = r.ttl(job_key)
@@ -74,21 +91,30 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             ttl = 86400
 
         current_clips: list[dict] = []
-        current_error: str | None = None
+        current_error: Any = None
+        current_warnings: list[dict] = []
         existing_raw = r.get(job_key)
         if existing_raw:
             try:
                 existing_data = json.loads(existing_raw)
                 current_clips = existing_data.get("clips", [])
                 current_error = existing_data.get("error")
+                current_warnings = existing_data.get("warnings", [])
             except Exception:
                 pass
 
+        active_warnings = (
+            warnings if warnings is not None else (warnings_list or current_warnings)
+        )
+
         state = JobStatusResponse(
             job_id=job_id,
-            status=status,
+            stage=stage,
+            status=stage,
             progress=progress,
+            updated_at=datetime.now(timezone.utc).isoformat(),
             error=error if error is not None else current_error,
+            warnings=active_warnings,
             clips=clips if clips is not None else current_clips,
         )
         r.set(job_key, state.model_dump_json(), ex=ttl)
@@ -169,6 +195,18 @@ def process_video_task(self, job_id: str, options: dict) -> None:
         completed_clips: list[dict] = []
         total_candidates = len(candidates)
 
+        # Determine face detector name and layout
+        layout_mode = options.get("layout_mode", "speaker")
+        detector_obj = _get_face_detector()
+        if layout_mode == "split":
+            detector_name = "split"
+        elif isinstance(detector_obj, getattr(cv2, "FaceDetectorYN", tuple())):
+            detector_name = "yunet"
+        elif isinstance(detector_obj, getattr(cv2, "CascadeClassifier", tuple())):
+            detector_name = "haar"
+        else:
+            detector_name = "none"
+
         for i, clip in enumerate(candidates, start=1):
             progress_step = 30 / total_candidates if total_candidates > 0 else 30
             current_progress = int(60 + (i - 1) * progress_step)
@@ -181,7 +219,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 video_path,
                 clip["start_time"],
                 clip["end_time"],
-                mode=options.get("layout_mode", "speaker"),
+                mode=layout_mode,
             )
             generate_ass_subtitles(
                 words,
@@ -204,6 +242,16 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             )
             public_url = upload_clip(final_clip_path, f"{job_id}/clip_{i}.mp4")
 
+            is_fb = bool(clip.get("is_fallback", False))
+            if is_fb:
+                warnings_list.append(
+                    {
+                        "code": "HEURISTIC_FALLBACK_CLIP",
+                        "message": f"Clip {i} generated using heuristic spacing due to insufficient viral hooks.",
+                        "clip_index": i,
+                    }
+                )
+
             completed_clips.append(
                 {
                     "clip_id": f"clip_{i}",
@@ -211,17 +259,34 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                     "virality_score": clip["virality_score"],
                     "duration": round(clip["end_time"] - clip["start_time"], 2),
                     "video_url": public_url,
-                    "is_fallback": clip.get("is_fallback", False),
+                    "is_fallback": is_fb,
                     "description": clip.get("description", ""),
                     "hashtags": clip.get("hashtags", []),
+                    "selection_method": "heuristic" if is_fb else "llm",
+                    "layout_used": layout_mode,
+                    "detector": detector_name,
+                    "caption_font": "Liberation Sans",
+                    "render_ok": True,
                 }
             )
 
         update_job_state("completed", 100, clips=completed_clips)
 
     except Exception as e:
-        logger.exception("Task failed for job %s: %s", job_id, e)
-        update_job_state("failed", 0, error=str(e))
+        pipeline_err = map_exception_to_pipeline_error(e, current_stage=current_stage)
+        logger.exception(
+            "Task failed for job %s at stage '%s' [%s]: %s",
+            job_id,
+            pipeline_err.stage,
+            pipeline_err.code.value,
+            pipeline_err.user_message,
+        )
+        update_job_state(
+            stage="failed",
+            progress=0,
+            error=pipeline_err.to_error_detail(),
+            warnings=warnings_list,
+        )
         raise
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

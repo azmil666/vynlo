@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import io
 import os
 import re
@@ -66,7 +67,13 @@ def _slugify(text: str) -> str:
 @app.post("/api/jobs", response_model=JobStatusResponse, status_code=status.HTTP_202_ACCEPTED)
 def create_job(req: JobCreateRequest):
     job_id = str(uuid4())
-    initial_status = JobStatusResponse(job_id=job_id, status="queued", progress=0)
+    initial_status = JobStatusResponse(
+        job_id=job_id,
+        stage="queued",
+        status="queued",
+        progress=0,
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
     get_redis_client().set(f"job:{job_id}", initial_status.model_dump_json(), ex=86400)
     process_video_task.delay(job_id, req.model_dump(mode="json"))
     return initial_status

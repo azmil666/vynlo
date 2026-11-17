@@ -2,6 +2,19 @@
 
 import { useEffect, useState, useCallback, useMemo } from "react";
 
+interface JobErrorDetail {
+  code: string;
+  message: string;
+  retryable?: boolean;
+  detail?: string | null;
+}
+
+interface JobWarning {
+  code: string;
+  message: string;
+  clip_index?: number | null;
+}
+
 interface ClipResult {
   clip_id: string;
   title: string;
@@ -11,6 +24,11 @@ interface ClipResult {
   is_fallback?: boolean;
   description?: string;
   hashtags?: string[];
+  selection_method?: "llm" | "heuristic";
+  layout_used?: "speaker" | "split";
+  detector?: string;
+  caption_font?: string;
+  render_ok?: boolean;
 }
 
 interface JobStatus {
@@ -23,8 +41,11 @@ interface JobStatus {
     | "rendering"
     | "completed"
     | "failed";
+  stage?: string;
   progress: number;
-  error?: string | null;
+  updated_at?: string;
+  error?: string | JobErrorDetail | null;
+  warnings?: JobWarning[];
   clips: ClipResult[];
 }
 
@@ -922,9 +943,16 @@ export default function HomePage() {
             {jobState.status === "failed" && (
               <div className="pt-2 space-y-3">
                 <div className="p-3 rounded bg-[#FF4D4D]/[0.05] border border-[#FF4D4D]/20 font-mono text-xs text-[#FF4D4D]">
-                  <p className="font-semibold mb-1">Execution Failure:</p>
+                  <p className="font-semibold mb-1">
+                    Execution Failure:{" "}
+                    {typeof jobState.error === "object" && jobState.error?.code ? (
+                      <span className="font-normal opacity-80">[{jobState.error.code}]</span>
+                    ) : null}
+                  </p>
                   <p className="opacity-90">
-                    {jobState.error || "An unexpected pipeline error occurred."}
+                    {typeof jobState.error === "object" && jobState.error !== null
+                      ? jobState.error.message
+                      : jobState.error || "An unexpected pipeline error occurred."}
                   </p>
                 </div>
                 <div className="flex justify-end">
