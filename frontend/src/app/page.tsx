@@ -1,20 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import {
-  AlertCircle,
-  ArrowRight,
-  CheckCircle2,
-  Clock,
-  Download,
-  Flame,
-  Gamepad2,
-  Loader2,
-  Scissors,
-  Sparkles,
-  User,
-  Video,
-} from "lucide-react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 
 interface ClipResult {
   clip_id: string;
@@ -43,11 +29,117 @@ const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 const HIGHLIGHT_COLORS = [
-  { label: "Classic Yellow", value: "&H0000FFFF", hex: "#FACC15" },
-  { label: "Neon Green", value: "&H0000FF00", hex: "#22C55E" },
-  { label: "Vibrant Cyan", value: "&H00FFFF00", hex: "#06B6D4" },
-  { label: "Hot Pink", value: "&H00B469FF", hex: "#EC4899" },
+  { label: "Yellow", value: "&H0000FFFF", hex: "#FFFF00" },
+  { label: "Neon Green", value: "&H0000FF00", hex: "#00FF00" },
+  { label: "Cyan", value: "&H00FFFF00", hex: "#00FFFF" },
+  { label: "Hot Pink", value: "&H00B469FF", hex: "#FF69B4" },
 ];
+
+const ORDERED_STAGES = [
+  { key: "queued", label: "Job queued" },
+  { key: "downloading", label: "Downloading media" },
+  { key: "transcribing", label: "Transcribing audio" },
+  { key: "analyzing", label: "Identifying viral hooks" },
+  { key: "rendering", label: "Cropping & rendering 9:16" },
+  { key: "completed", label: "Pipeline completed" },
+] as const;
+
+function resolveVideoUrl(rawUrl: string): string {
+  if (!rawUrl) return "";
+  if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
+    return rawUrl;
+  }
+  return `${API_BASE_URL.replace(/\/$/, "")}/${rawUrl.replace(/^\//, "")}`;
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+  return (
+    <kbd className="inline-flex items-center justify-center font-mono text-[10px] px-1.5 py-0.5 rounded bg-white/[0.08] text-[#888888] border border-white/[0.12] leading-none">
+      {children}
+    </kbd>
+  );
+}
+
+function StatusDot({
+  status,
+  pulse = false,
+}: {
+  status: "online" | "offline" | "checking" | "active" | "error" | "done";
+  pulse?: boolean;
+}) {
+  const colorClass = useMemo(() => {
+    switch (status) {
+      case "online":
+      case "done":
+        return "bg-[#50E3C2]";
+      case "offline":
+      case "error":
+        return "bg-[#FF4D4D]";
+      case "active":
+        return "bg-[#EDEDED]";
+      case "checking":
+      default:
+        return "bg-[#888888]";
+    }
+  }, [status]);
+
+  return (
+    <span className="relative flex h-2 w-2 items-center justify-center">
+      {pulse && (
+        <span
+          className={`absolute inline-flex h-full w-full rounded-full opacity-60 animate-ping ${colorClass}`}
+        />
+      )}
+      <span
+        className={`relative inline-flex h-1.5 w-1.5 rounded-full ${colorClass}`}
+      />
+    </span>
+  );
+}
+
+function SegmentedProgressBar({
+  progress,
+  isFailed = false,
+  totalSegments = 24,
+}: {
+  progress: number;
+  isFailed?: boolean;
+  totalSegments?: number;
+}) {
+  const safeProgress = Math.min(100, Math.max(0, progress));
+  const activeCount = Math.round((safeProgress / 100) * totalSegments);
+
+  return (
+    <div
+      role="progressbar"
+      aria-valuenow={safeProgress}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      className="flex w-full items-center gap-[3px]"
+    >
+      {Array.from({ length: totalSegments }).map((_, idx) => {
+        const isFilled = idx < activeCount;
+        const isCurrent = idx === activeCount - 1 && !isFailed && safeProgress < 100;
+
+        let bgClass = "bg-white/[0.08]";
+        if (isFailed) {
+          bgClass = isFilled ? "bg-[#FF4D4D]" : "bg-white/[0.08]";
+        } else if (isFilled) {
+          bgClass = "bg-white";
+        }
+
+        return (
+          <div
+            key={idx}
+            className={`h-1.5 flex-1 rounded-[1px] transition-colors duration-150 ${bgClass} ${
+              isCurrent ? "animate-shimmer" : ""
+            }`}
+          />
+        );
+      })}
+    </div>
+  );
+}
 
 export default function HomePage() {
   const [url, setUrl] = useState("");
@@ -61,6 +153,16 @@ export default function HomePage() {
 
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [jobState, setJobState] = useState<JobStatus | null>(null);
+
+  const [isMac, setIsMac] = useState(false);
+  const [copiedKeys, setCopiedKeys] = useState<Record<string, boolean>>({});
+
+  // Detect platform in useEffect to avoid hydration mismatch
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      setIsMac(/(Mac|iPhone|iPod|iPad)/i.test(navigator.userAgent));
+    }
+  }, []);
 
   // Check backend health on mount
   useEffect(() => {
@@ -108,415 +210,686 @@ export default function HomePage() {
     };
   }, [currentJobId]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!url.trim()) return;
-
-    setIsSubmitting(true);
-    setSubmitError(null);
-    setJobState(null);
-    setCurrentJobId(null);
-
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/jobs`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: url.trim(),
-          layout_mode: layoutMode,
-          max_clips: Number(maxClips),
-          highlight_color: highlightColor,
-        }),
-      });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || "Failed to create clipping job");
+  const handleSubmit = useCallback(
+    async (e?: React.FormEvent) => {
+      if (e) e.preventDefault();
+      if (!url.trim() || isSubmitting) return;
+      if (
+        jobState &&
+        jobState.status !== "completed" &&
+        jobState.status !== "failed"
+      ) {
+        return;
       }
 
-      const initialData: JobStatus = await res.json();
-      setCurrentJobId(initialData.job_id);
-      setJobState(initialData);
-    } catch (err: any) {
-      setSubmitError(err.message || "Failed to connect to API");
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
+      setIsSubmitting(true);
+      setSubmitError(null);
+      setJobState(null);
+      setCurrentJobId(null);
 
-  const handleReset = () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/api/jobs`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            url: url.trim(),
+            layout_mode: layoutMode,
+            max_clips: Number(maxClips),
+            highlight_color: highlightColor,
+          }),
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.detail || "Failed to create clipping job");
+        }
+
+        const initialData: JobStatus = await res.json();
+        setCurrentJobId(initialData.job_id);
+        setJobState(initialData);
+      } catch (err: unknown) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : "Failed to connect to API server";
+        setSubmitError(msg);
+      } finally {
+        setIsSubmitting(false);
+      }
+    },
+    [url, layoutMode, maxClips, highlightColor, isSubmitting, jobState]
+  );
+
+  const handleReset = useCallback(() => {
     setCurrentJobId(null);
     setJobState(null);
     setUrl("");
     setSubmitError(null);
-  };
+  }, []);
 
-  const stages = [
-    { key: "downloading", label: "Downloading Media", threshold: 10 },
-    { key: "transcribing", label: "Transcribing Audio", threshold: 30 },
-    { key: "analyzing", label: "Finding Viral Hooks", threshold: 50 },
-    { key: "rendering", label: "Cropping & Rendering", threshold: 90 },
-  ];
+  const handleCopy = useCallback(async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKeys((prev) => ({ ...prev, [key]: true }));
+      setTimeout(() => {
+        setCopiedKeys((prev) => ({ ...prev, [key]: false }));
+      }, 1500);
+    } catch {
+      // Fallback silently if clipboard permissions are restricted
+    }
+  }, []);
 
-  const getStageStatus = (stageThreshold: number) => {
-    if (!jobState) return "waiting";
-    if (jobState.status === "failed") return "error";
-    if (jobState.status === "completed") return "done";
-    if (jobState.progress >= stageThreshold) return "done";
-    if (
-      jobState.progress >= stageThreshold - 25 &&
-      jobState.progress < stageThreshold
-    )
-      return "current";
-    return "waiting";
-  };
+  // Keyboard shortcut listener (Cmd/Ctrl + Enter)
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        handleSubmit();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [handleSubmit]);
+
+  const selectedColorObj = useMemo(
+    () =>
+      HIGHLIGHT_COLORS.find((c) => c.value === highlightColor) ||
+      HIGHLIGHT_COLORS[0],
+    [highlightColor]
+  );
+
+  const isJobActive = Boolean(
+    jobState &&
+      jobState.status !== "completed" &&
+      jobState.status !== "failed"
+  );
+
+  const currentStageIndex = useMemo(() => {
+    if (!jobState) return -1;
+    if (jobState.status === "completed") return ORDERED_STAGES.length;
+    return ORDERED_STAGES.findIndex((s) => s.key === jobState.status);
+  }, [jobState]);
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 py-10 px-4 sm:px-6 lg:px-8">
-      <div className="max-w-6xl mx-auto space-y-10">
-        {/* Header */}
-        <header className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-zinc-800 pb-6">
-          <div className="flex items-center gap-3">
-            <div className="w-11 h-11 rounded-xl bg-gradient-to-tr from-amber-500 to-orange-500 flex items-center justify-center shadow-lg shadow-orange-500/20 text-black">
-              <Scissors className="w-6 h-6 stroke-[2.5]" />
-            </div>
-            <div>
-              <h1 className="text-2xl font-bold tracking-tight text-white flex items-center gap-2">
-                Clipper AI
-                <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                  MVP Studio
-                </span>
-              </h1>
-              <p className="text-xs text-zinc-400">
-                Stream to Viral Shorts & Reels Pipeline
-              </p>
-            </div>
+    <div className="relative min-h-screen bg-black text-[#EDEDED] antialiased">
+      {/* Background Architectural Dot Grid */}
+      <div className="pointer-events-none fixed inset-0 dot-grid z-0 opacity-80" />
+
+      {/* Main Content Container */}
+      <div className="relative z-10 mx-auto max-w-6xl px-4 sm:px-6 py-10 sm:py-14 space-y-8">
+        {/* Header Bar */}
+        <header className="flex items-center justify-between border-b border-white/[0.08] pb-4">
+          <div className="flex items-center gap-2.5">
+            <svg
+              className="w-4 h-4 text-white"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <line x1="4" y1="20" x2="20" y2="4" />
+              <polyline points="4,4 4,20 20,20" />
+            </svg>
+            <span className="font-semibold text-sm tracking-tight text-[#EDEDED]">
+              Clipper Studio
+            </span>
+            <span className="text-[11px] font-mono text-[#888888] px-1.5 py-0.5 rounded border border-white/[0.08] bg-[#0A0A0A]">
+              v0.1
+            </span>
           </div>
 
-          <div className="flex items-center gap-2 text-xs">
-            <span
-              className={`w-2 h-2 rounded-full ${
+          <div className="flex items-center gap-2 text-xs font-mono">
+            <StatusDot
+              status={
                 backendOnline === true
-                  ? "bg-emerald-500 shadow-sm shadow-emerald-500/50"
+                  ? "online"
                   : backendOnline === false
-                  ? "bg-rose-500"
-                  : "bg-zinc-600 animate-pulse"
-              }`}
+                  ? "offline"
+                  : "checking"
+              }
+              pulse={backendOnline === true}
             />
-            <span className="text-zinc-400">
+            <span className="text-[#888888]">
               {backendOnline === true
-                ? "API Connected (port 8000)"
+                ? "api · online"
                 : backendOnline === false
-                ? "API Offline (Start Docker)"
-                : "Checking Backend..."}
+                ? "api · offline"
+                : "api · checking"}
             </span>
           </div>
         </header>
 
-        {/* Form Card */}
-        <div className="bg-zinc-900/70 border border-zinc-800 rounded-2xl p-6 sm:p-8 backdrop-blur shadow-xl">
-          <form onSubmit={handleSubmit} className="space-y-6">
-            <div>
+        {/* Hero Section */}
+        <section className="space-y-1.5 pt-2">
+          <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-[#EDEDED]">
+            YouTube to Shorts
+          </h1>
+          <p className="text-sm text-[#888888] max-w-xl">
+            Extract high-retention vertical clips with MediaPipe face tracking,
+            speech transcription, and animated karaoke captions.
+          </p>
+        </section>
+
+        {/* Composer Panel */}
+        <section className="bg-[#0A0A0A] border border-white/[0.08] rounded-lg p-5 sm:p-6 space-y-6">
+          <form onSubmit={handleSubmit} className="space-y-5">
+            {/* URL Input */}
+            <div className="space-y-2">
               <label
                 htmlFor="video-url"
-                className="block text-sm font-medium text-zinc-200 mb-2"
+                className="block text-xs uppercase tracking-wider font-mono text-[#888888]"
               >
-                YouTube / Stream URL
+                Source Stream / Video URL
               </label>
-              <div className="relative">
+              <div className="relative flex items-center">
+                <span className="absolute left-3.5 text-[#888888] pointer-events-none">
+                  <svg
+                    className="w-4 h-4"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+                  </svg>
+                </span>
                 <input
                   id="video-url"
                   type="url"
                   required
-                  placeholder="https://www.youtube.com/watch?v=..."
+                  placeholder="https://youtube.com/watch?v=..."
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
-                  disabled={isSubmitting || !!(jobState && jobState.status !== "completed" && jobState.status !== "failed")}
-                  className="w-full bg-zinc-950 border border-zinc-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-amber-500/20 transition disabled:opacity-50"
+                  disabled={isSubmitting || isJobActive}
+                  className="w-full bg-black border border-white/[0.08] hover:border-white/[0.16] focus:border-white/[0.24] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 rounded-md pl-10 pr-4 py-2.5 text-sm font-mono text-[#EDEDED] placeholder-[#555555] transition-colors disabled:opacity-50"
                 />
               </div>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              {/* Layout Mode */}
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2">
-                  Layout Framing
-                </label>
-                <div className="grid grid-cols-2 gap-2">
+            {/* Config Controls Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-5 pt-1">
+              {/* Layout Mode Segmented Control */}
+              <div className="space-y-2">
+                <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
+                  Layout Mode
+                </span>
+                <div
+                  role="radiogroup"
+                  aria-label="Layout Framing"
+                  className="grid grid-cols-2 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
+                >
                   <button
                     type="button"
+                    role="radio"
+                    aria-checked={layoutMode === "speaker"}
                     onClick={() => setLayoutMode("speaker")}
-                    className={`flex flex-col items-center justify-center gap-1.5 p-3 rounded-xl border text-xs font-medium transition ${
+                    disabled={isSubmitting || isJobActive}
+                    className={`flex items-center justify-center gap-2 py-1.5 px-3 rounded text-xs font-medium transition-colors ${
                       layoutMode === "speaker"
-                        ? "bg-amber-500/10 border-amber-500/50 text-amber-300"
-                        : "bg-zinc-950/60 border-zinc-800 text-zinc-400 hover:border-zinc-700"
+                        ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
+                        : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
                     }`}
                   >
-                    <User className="w-4 h-4" />
-                    <span>Smart Face Crop</span>
+                    <svg
+                      className="w-3.5 h-3.5 flex-shrink-0"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                    >
+                      <rect x="5" y="3" width="14" height="18" rx="2" />
+                      <circle cx="12" cy="10" r="3" />
+                      <path d="M7 19c0-2.5 2-4 5-4s5 1.5 5 4" />
+                    </svg>
+                    <span>Speaker</span>
                   </button>
+
                   <button
                     type="button"
+                    role="radio"
+                    aria-checked={layoutMode === "split"}
                     onClick={() => setLayoutMode("split")}
-                    className={`flex flex-col items-center justify-center gap-1.5 p-3 rounded-xl border text-xs font-medium transition ${
+                    disabled={isSubmitting || isJobActive}
+                    className={`flex items-center justify-center gap-2 py-1.5 px-3 rounded text-xs font-medium transition-colors ${
                       layoutMode === "split"
-                        ? "bg-amber-500/10 border-amber-500/50 text-amber-300"
-                        : "bg-zinc-950/60 border-zinc-800 text-zinc-400 hover:border-zinc-700"
+                        ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
+                        : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
                     }`}
                   >
-                    <Gamepad2 className="w-4 h-4" />
-                    <span>Split Screen</span>
+                    <svg
+                      className="w-3.5 h-3.5 flex-shrink-0"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                    >
+                      <rect x="5" y="3" width="14" height="18" rx="2" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                      <circle cx="15.5" cy="16.5" r="1.5" />
+                    </svg>
+                    <span>Split</span>
                   </button>
                 </div>
               </div>
 
-              {/* Max Clips */}
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2">
-                  Clips to Generate
-                </label>
-                <div className="grid grid-cols-3 gap-2">
+              {/* Max Clips Segmented Control */}
+              <div className="space-y-2">
+                <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
+                  Max Clips
+                </span>
+                <div
+                  role="radiogroup"
+                  aria-label="Max Clips"
+                  className="grid grid-cols-3 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
+                >
                   {[1, 3, 5].map((num) => (
                     <button
                       key={num}
                       type="button"
+                      role="radio"
+                      aria-checked={maxClips === num}
                       onClick={() => setMaxClips(num)}
-                      className={`p-3 rounded-xl border text-xs font-medium transition ${
+                      disabled={isSubmitting || isJobActive}
+                      className={`py-1.5 px-2 rounded text-xs font-mono tabular-nums transition-colors ${
                         maxClips === num
-                          ? "bg-amber-500/10 border-amber-500/50 text-amber-300"
-                          : "bg-zinc-950/60 border-zinc-800 text-zinc-400 hover:border-zinc-700"
+                          ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
+                          : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
                       }`}
                     >
-                      {num} {num === 1 ? "Clip" : "Clips"}
+                      {num}
                     </button>
                   ))}
                 </div>
               </div>
 
-              {/* Highlight Color */}
-              <div>
-                <label className="block text-sm font-medium text-zinc-300 mb-2">
+              {/* Highlight Color Picker */}
+              <div className="space-y-2">
+                <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
                   Subtitle Highlight
-                </label>
-                <div className="flex items-center gap-2 h-11">
-                  {HIGHLIGHT_COLORS.map((c) => (
-                    <button
-                      key={c.value}
-                      type="button"
-                      onClick={() => setHighlightColor(c.value)}
-                      title={c.label}
-                      className={`w-9 h-9 rounded-xl border-2 transition flex items-center justify-center ${
-                        highlightColor === c.value
-                          ? "border-white scale-110 shadow-lg"
-                          : "border-transparent opacity-70 hover:opacity-100"
-                      }`}
-                      style={{ backgroundColor: c.hex }}
-                    >
-                      {highlightColor === c.value && (
-                        <span className="w-2 h-2 rounded-full bg-black/80" />
-                      )}
-                    </button>
-                  ))}
+                </span>
+                <div className="flex items-center justify-between p-1 px-2 h-9 bg-black rounded-md border border-white/[0.08]">
+                  <div
+                    role="radiogroup"
+                    aria-label="Highlight Color"
+                    className="flex items-center gap-2"
+                  >
+                    {HIGHLIGHT_COLORS.map((c) => {
+                      const isSelected = highlightColor === c.value;
+                      return (
+                        <button
+                          key={c.value}
+                          type="button"
+                          role="radio"
+                          aria-label={c.label}
+                          aria-checked={isSelected}
+                          onClick={() => setHighlightColor(c.value)}
+                          disabled={isSubmitting || isJobActive}
+                          className={`w-4 h-4 rounded-full transition-transform focus:outline-none ${
+                            isSelected
+                              ? "ring-1 ring-white ring-offset-2 ring-offset-[#0A0A0A] scale-110"
+                              : "opacity-75 hover:opacity-100"
+                          }`}
+                          style={{ backgroundColor: c.hex }}
+                        />
+                      );
+                    })}
+                  </div>
+                  <span className="text-[11px] font-mono text-[#888888]">
+                    {selectedColorObj.label}
+                  </span>
                 </div>
               </div>
             </div>
 
+            {/* Error Banner */}
             {submitError && (
-              <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-sm flex items-center gap-3">
-                <AlertCircle className="w-5 h-5 flex-shrink-0" />
-                <span>{submitError}</span>
+              <div className="p-3 rounded-md bg-[#FF4D4D]/[0.05] border border-[#FF4D4D]/20 text-xs font-mono text-[#FF4D4D] flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <svg
+                    className="w-3.5 h-3.5 flex-shrink-0"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                  >
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="12" y1="8" x2="12" y2="12" />
+                    <line x1="12" y1="16" x2="12.01" y2="16" />
+                  </svg>
+                  <span>{submitError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSubmitError(null)}
+                  className="text-[11px] underline opacity-80 hover:opacity-100"
+                >
+                  Dismiss
+                </button>
               </div>
             )}
 
-            <button
-              type="submit"
-              disabled={
-                isSubmitting ||
-                !url.trim() ||
-                (!!jobState &&
-                  jobState.status !== "completed" &&
-                  jobState.status !== "failed")
-              }
-              className="w-full py-3.5 px-6 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 text-black font-semibold text-sm hover:from-amber-400 hover:to-orange-400 focus:outline-none focus:ring-2 focus:ring-amber-500/50 transition shadow-lg shadow-orange-500/20 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-            >
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Submitting Video...</span>
-                </>
-              ) : jobState &&
-                jobState.status !== "completed" &&
-                jobState.status !== "failed" ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Pipeline Running ({jobState.progress}%)...</span>
-                </>
-              ) : (
-                <>
-                  <Sparkles className="w-4 h-4" />
-                  <span>Generate Viral Shorts</span>
-                  <ArrowRight className="w-4 h-4" />
-                </>
-              )}
-            </button>
-          </form>
-        </div>
-
-        {/* Live Pipeline Tracker */}
-        {jobState && (
-          <div className="bg-zinc-900/60 border border-zinc-800 rounded-2xl p-6 sm:p-8 space-y-6">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-zinc-800/80 pb-4">
-              <div>
-                <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-                  <span>Processing Pipeline</span>
-                  <span className="text-xs text-zinc-500 font-mono">
-                    ID: {jobState.job_id.slice(0, 8)}...
-                  </span>
-                </h2>
-                <p className="text-xs text-zinc-400 capitalize">
-                  Current Status: {jobState.status}
-                </p>
+            {/* Action Bar */}
+            <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
+              <div className="flex items-center gap-2 text-xs text-[#888888]">
+                <span>Shortcut</span>
+                <Kbd>{isMac ? "⌘ ↵" : "Ctrl ↵"}</Kbd>
               </div>
-              <div className="text-2xl font-bold font-mono text-amber-400">
-                {jobState.progress}%
+
+              <button
+                type="submit"
+                disabled={isSubmitting || !url.trim() || isJobActive}
+                className="w-full sm:w-auto h-9 px-4 rounded-md bg-white text-black hover:bg-[#EDEDED] active:scale-[0.98] font-medium text-xs tracking-tight transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              >
+                {isSubmitting ? (
+                  <>
+                    <svg
+                      className="w-3.5 h-3.5 animate-spin"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                    >
+                      <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                      <path d="M12 2a10 10 0 0 1 10 10" />
+                    </svg>
+                    <span>Submitting...</span>
+                  </>
+                ) : isJobActive ? (
+                  <>
+                    <svg
+                      className="w-3.5 h-3.5 animate-spin"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.5"
+                    >
+                      <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                      <path d="M12 2a10 10 0 0 1 10 10" />
+                    </svg>
+                    <span>Running ({jobState?.progress ?? 0}%)</span>
+                  </>
+                ) : (
+                  <span>Generate Shorts</span>
+                )}
+              </button>
+            </div>
+          </form>
+        </section>
+
+        {/* Pipeline Status Panel */}
+        {jobState && (
+          <section className="bg-[#0A0A0A] border border-white/[0.08] rounded-lg p-5 space-y-4">
+            {/* Header bar */}
+            <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-xs uppercase font-mono tracking-wider text-[#888888]">
+                  Job
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleCopy("job-id", jobState.job_id)}
+                  title="Click to copy Job ID"
+                  className="font-mono text-xs text-[#EDEDED] hover:text-white px-1.5 py-0.5 rounded hover:bg-[#111111] transition-colors flex items-center gap-1.5"
+                >
+                  <span>{jobState.job_id.slice(0, 12)}…</span>
+                  {copiedKeys["job-id"] ? (
+                    <span className="text-[10px] text-[#50E3C2]">copied</span>
+                  ) : (
+                    <svg
+                      className="w-3 h-3 text-[#888888]"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                    >
+                      <rect x="9" y="9" width="13" height="13" rx="2" />
+                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+
+              <div
+                aria-live="polite"
+                className="flex items-center gap-2 font-mono text-xs text-[#888888]"
+              >
+                <span className="text-[#EDEDED] capitalize">
+                  {jobState.status}
+                </span>
+                <span>·</span>
+                <span className="tabular-nums">{jobState.progress}%</span>
               </div>
             </div>
 
-            {/* Stepper */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              {stages.map((st, idx) => {
-                const status = getStageStatus(st.threshold);
+            {/* Segmented linear progress bar */}
+            <SegmentedProgressBar
+              progress={jobState.progress}
+              isFailed={jobState.status === "failed"}
+            />
+
+            {/* Live Pipeline Step List */}
+            <div className="pt-2 space-y-2 font-mono text-xs">
+              {ORDERED_STAGES.map((stage, idx) => {
+                const isCompleted =
+                  jobState.status === "completed" ||
+                  (currentStageIndex > idx && jobState.status !== "failed");
+                const isCurrent =
+                  stage.key === jobState.status &&
+                  stage.key !== "completed";
+                const isFailed =
+                  jobState.status === "failed" && currentStageIndex === idx;
+
                 return (
                   <div
-                    key={st.key}
-                    className={`p-4 rounded-xl border transition ${
-                      status === "done"
-                        ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
-                        : status === "current"
-                        ? "bg-amber-500/10 border-amber-500/40 text-amber-300 ring-1 ring-amber-500/20"
-                        : status === "error"
-                        ? "bg-rose-500/10 border-rose-500/20 text-rose-400"
-                        : "bg-zinc-950/40 border-zinc-800/80 text-zinc-500"
-                    }`}
+                    key={stage.key}
+                    className="flex items-center justify-between py-1 px-1.5 rounded transition-colors"
                   >
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-xs font-mono font-medium opacity-60">
-                        Step 0{idx + 1}
-                      </span>
-                      {status === "done" ? (
-                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                      ) : status === "current" ? (
-                        <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
+                    <div className="flex items-center gap-2.5">
+                      {isCompleted ? (
+                        <span className="w-3.5 h-3.5 rounded-full bg-[#50E3C2]/10 text-[#50E3C2] flex items-center justify-center text-[10px]">
+                          ✓
+                        </span>
+                      ) : isCurrent ? (
+                        <span className="w-3.5 h-3.5 flex items-center justify-center">
+                          <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse-dot" />
+                        </span>
+                      ) : isFailed ? (
+                        <span className="w-3.5 h-3.5 rounded-full bg-[#FF4D4D]/10 text-[#FF4D4D] flex items-center justify-center text-[10px]">
+                          ✕
+                        </span>
                       ) : (
-                        <Clock className="w-4 h-4 opacity-40" />
+                        <span className="w-3.5 h-3.5 flex items-center justify-center">
+                          <span className="w-1.5 h-1.5 rounded-full border border-white/20" />
+                        </span>
                       )}
+
+                      <span
+                        className={
+                          isCurrent
+                            ? "text-[#EDEDED] font-medium"
+                            : isCompleted
+                            ? "text-[#888888]"
+                            : isFailed
+                            ? "text-[#FF4D4D]"
+                            : "text-[#888888]/50"
+                        }
+                      >
+                        {stage.label}
+                      </span>
                     </div>
-                    <div className="text-xs font-semibold">{st.label}</div>
+
+                    <span className="text-[11px] text-[#555555]">
+                      {isCompleted
+                        ? "done"
+                        : isCurrent
+                        ? "running…"
+                        : isFailed
+                        ? "failed"
+                        : "pending"}
+                    </span>
                   </div>
                 );
               })}
             </div>
 
-            {/* Progress Bar */}
-            <div className="w-full bg-zinc-950 rounded-full h-2 overflow-hidden border border-zinc-800">
-              <div
-                className={`h-full transition-all duration-500 rounded-full ${
-                  jobState.status === "failed"
-                    ? "bg-rose-500"
-                    : jobState.status === "completed"
-                    ? "bg-emerald-500"
-                    : "bg-gradient-to-r from-amber-500 to-orange-500"
-                }`}
-                style={{ width: `${Math.max(5, jobState.progress)}%` }}
-              />
-            </div>
-
-            {/* Error Message */}
+            {/* Failure Box */}
             {jobState.status === "failed" && (
-              <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div className="flex items-center gap-3">
-                  <AlertCircle className="w-5 h-5 flex-shrink-0 text-rose-400" />
-                  <span>
-                    Pipeline failed: {jobState.error || "Unknown error occurred"}
-                  </span>
+              <div className="pt-2 space-y-3">
+                <div className="p-3 rounded bg-[#FF4D4D]/[0.05] border border-[#FF4D4D]/20 font-mono text-xs text-[#FF4D4D]">
+                  <p className="font-semibold mb-1">Execution Failure:</p>
+                  <p className="opacity-90">
+                    {jobState.error || "An unexpected pipeline error occurred."}
+                  </p>
                 </div>
-                <button
-                  onClick={handleReset}
-                  className="px-4 py-2 bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 border border-rose-500/40 text-xs font-medium rounded-lg transition"
-                >
-                  Try Another Link
-                </button>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleReset}
+                    className="h-8 px-3 rounded text-xs font-mono text-[#888888] hover:text-[#EDEDED] border border-white/[0.08] hover:bg-[#111111] transition-colors"
+                  >
+                    Try another link
+                  </button>
+                </div>
               </div>
             )}
-          </div>
+          </section>
         )}
 
-        {/* Generated Shorts Gallery */}
-        {jobState && jobState.clips && jobState.clips.length > 0 && (
-          <div className="space-y-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                  <Sparkles className="w-5 h-5 text-amber-400" />
-                  Generated Viral Shorts
-                </h2>
-                <p className="text-xs text-zinc-400">
-                  {jobState.clips.length} vertical 9:16 clips produced with dynamic karaoke subtitles
-                </p>
-              </div>
+        {/* Results Section */}
+        <section className="space-y-4">
+          <div className="flex items-center justify-between border-b border-white/[0.08] pb-3">
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm font-medium text-[#EDEDED]">Clips</h2>
+              <span className="font-mono text-xs px-1.5 py-0.5 rounded border border-white/[0.08] text-[#888888] tabular-nums">
+                {jobState?.clips?.length ?? 0}
+              </span>
             </div>
+          </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-              {jobState.clips.map((clip) => (
-                <div
-                  key={clip.clip_id}
-                  className="bg-zinc-900 border border-zinc-800 rounded-2xl overflow-hidden shadow-2xl flex flex-col group hover:border-zinc-700 transition"
-                >
-                  {/* Video Player */}
-                  <div className="relative aspect-[9/16] bg-black">
-                    <video
-                      src={clip.video_url}
-                      controls
-                      playsInline
-                      preload="metadata"
-                      className="w-full h-full object-cover"
-                    />
-                  </div>
+          {jobState && jobState.clips && jobState.clips.length > 0 ? (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {jobState.clips.map((clip, idx) => {
+                const resolvedUrl = resolveVideoUrl(clip.video_url);
+                const isTitleCopied = copiedKeys[`${clip.clip_id}-title`];
+                const isLinkCopied = copiedKeys[`${clip.clip_id}-link`];
 
-                  {/* Clip Info */}
-                  <div className="p-4 flex-1 flex flex-col justify-between gap-4 bg-zinc-900/90">
-                    <div>
-                      <div className="flex items-center justify-between gap-2 mb-2">
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-orange-500/10 text-orange-400 border border-orange-500/20">
-                          <Flame className="w-3.5 h-3.5" />
-                          {clip.virality_score}/100 Virality
-                        </span>
-                        <span className="text-xs text-zinc-400 font-mono">
+                const scoreColor =
+                  clip.virality_score >= 80
+                    ? "text-[#EDEDED]"
+                    : clip.virality_score >= 50
+                    ? "text-[#888888]"
+                    : "text-[#555555]";
+
+                return (
+                  <div
+                    key={clip.clip_id}
+                    style={{ animationDelay: `${idx * 40}ms` }}
+                    className="animate-fade-in bg-[#0A0A0A] border border-white/[0.08] hover:border-white/[0.16] rounded-lg overflow-hidden transition-colors flex flex-col"
+                  >
+                    {/* Header Metadata Bar */}
+                    <div className="px-3 h-9 border-b border-white/[0.08] flex items-center justify-between gap-2 text-xs">
+                      <span
+                        title={clip.title}
+                        className="truncate font-medium text-[#EDEDED] text-xs max-w-[55%]"
+                      >
+                        {clip.title}
+                      </span>
+                      <div className="flex items-center gap-2 font-mono tabular-nums text-[11px]">
+                        <span className="text-[#888888]">
                           {clip.duration}s
                         </span>
+                        <span className="text-[#555555]">·</span>
+                        <span className={scoreColor} title="Virality Score">
+                          {clip.virality_score}/100
+                        </span>
                       </div>
-                      <h3 className="text-sm font-semibold text-zinc-100 line-clamp-2">
-                        {clip.title}
-                      </h3>
                     </div>
 
-                    <a
-                      href={clip.video_url}
-                      download={`${clip.clip_id}.mp4`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="w-full py-2.5 px-4 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium transition flex items-center justify-center gap-2 border border-zinc-700"
-                    >
-                      <Download className="w-4 h-4" />
-                      <span>Download MP4</span>
-                    </a>
+                    {/* 9:16 Video Frame */}
+                    <div className="aspect-[9/16] bg-black w-full relative">
+                      <video
+                        src={resolvedUrl}
+                        controls
+                        playsInline
+                        preload="metadata"
+                        className="w-full h-full object-contain bg-black"
+                      />
+                    </div>
+
+                    {/* Footer Action Bar */}
+                    <div className="px-3 h-9 border-t border-white/[0.08] flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopy(`${clip.clip_id}-title`, clip.title)
+                          }
+                          className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors"
+                        >
+                          {isTitleCopied ? "Copied" : "Copy Title"}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopy(`${clip.clip_id}-link`, resolvedUrl)
+                          }
+                          className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors"
+                        >
+                          {isLinkCopied ? "Copied" : "Copy Link"}
+                        </button>
+                      </div>
+
+                      <a
+                        href={resolvedUrl}
+                        download={`${clip.clip_id}.mp4`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors flex items-center gap-1"
+                      >
+                        <span>Download</span>
+                        <svg
+                          className="w-3 h-3"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                        >
+                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                          <polyline points="7 10 12 15 17 10" />
+                          <line x1="12" y1="15" x2="12" y2="3" />
+                        </svg>
+                      </a>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
-          </div>
-        )}
+          ) : (
+            /* Idle & Empty State */
+            <div className="border border-dashed border-white/[0.08] rounded-lg p-10 text-center">
+              <p className="text-xs font-mono text-[#888888]">
+                No clips yet. Paste a URL and press{" "}
+                <Kbd>{isMac ? "⌘ ↵" : "Ctrl ↵"}</Kbd>
+              </p>
+            </div>
+          )}
+        </section>
+
+        {/* Minimal Footer */}
+        <footer className="pt-8 border-t border-white/[0.08] flex items-center justify-between text-[11px] font-mono text-[#888888]">
+          <span>Clipper AI Studio</span>
+          <span>API · {API_BASE_URL}</span>
+        </footer>
       </div>
     </div>
   );

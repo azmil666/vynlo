@@ -1,13 +1,23 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 
-const inter = Inter({ subsets: ["latin"] });
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-sans",
+  display: "swap",
+});
+
+const jetbrainsMono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-mono",
+  display: "swap",
+});
 
 export const metadata: Metadata = {
-  title: "Clipper MVP | AI Shorts Generator",
+  title: "Clipper — YouTube to Shorts Studio",
   description:
-    "Transform YouTube streams and videos into high-retention vertical shorts automatically.",
+    "Monochrome minimalist studio for extracting high-retention vertical clips with speech tracking and karaoke subtitles.",
 };
 
 export default function RootLayout({
@@ -16,10 +26,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="dark">
-      <body
-        className={`${inter.className} bg-zinc-950 text-zinc-100 antialiased min-h-screen selection:bg-amber-500 selection:text-black`}
-      >
+    <html
+      lang="en"
+      className={`dark ${inter.variable} ${jetbrainsMono.variable}`}
+    >
+      <body className="bg-black text-[#EDEDED] font-sans antialiased min-h-screen selection:bg-white selection:text-black">
         {children}
       </body>
     </html>
