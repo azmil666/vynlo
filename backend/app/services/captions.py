@@ -28,12 +28,50 @@ def generate_ass_subtitles(
     start_time: float,
     end_time: float,
     output_ass_path: str,
-    highlight_color: str = "&H0000FFFF",
+    preset: str = "clean_white",
+    safe_zone: str = "shorts",
+    highlight_color: str = "&H00FFFFFF",
 ) -> str:
-    """Generate dynamic ASS karaoke subtitle file with highlighted active words."""
+    """Generate dynamic ASS subtitle file with presets and safe zones."""
     out_dir = os.path.dirname(output_ass_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+
+    # Safe zone margins: shorts -> 380, reels -> 420, tiktok -> 460
+    safe_zone_margins = {
+        "shorts": 380,
+        "reels": 420,
+        "tiktok": 460,
+    }
+    margin_v = safe_zone_margins.get(safe_zone.lower(), 380)
+
+    # Preset configurations
+    font_name = "Liberation Sans"
+    primary_color = "&H00FFFFFF"
+    outline_color = "&H00000000"
+    back_color = "&H80000000"
+
+    if preset == "boxed":
+        font_size = 74
+        border_style = 3  # Opaque background box
+        outline = 6
+        shadow = 0
+        back_color = "&H99000000"
+    elif preset == "minimal":
+        font_size = 62
+        border_style = 1
+        outline = 3
+        shadow = 1
+    elif preset == "bold_yellow":
+        font_size = 78
+        border_style = 1
+        outline = 6
+        shadow = 2
+    else:  # clean_white (default)
+        font_size = 78
+        border_style = 1
+        outline = 5
+        shadow = 2
 
     header = (
         "[Script Info]\n"
@@ -45,15 +83,21 @@ def generate_ass_subtitles(
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Default,Arial,78,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,2,2,60,60,380,1\n\n"
+        f"Style: Default,{font_name},{font_size},{primary_color},&H0000FFFF,{outline_color},{back_color},"
+        f"-1,0,0,0,100,100,0,0,{border_style},{outline},{shadow},2,60,60,{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
+    # Determine highlight color tag
+    active_color = highlight_color
+    if preset == "bold_yellow" and (not active_color or active_color == "&H00FFFFFF"):
+        active_color = "&H0000FFFF"
+
     color_tag = (
-        highlight_color
-        if highlight_color.endswith("&")
-        else f"{highlight_color}&"
+        active_color
+        if active_color.endswith("&")
+        else f"{active_color}&"
     )
 
     filtered_words: list[dict] = []
@@ -109,9 +153,22 @@ def generate_ass_subtitles(
                 words_formatted = []
                 for i, w_item in enumerate(chunk):
                     if i == idx:
-                        words_formatted.append(
-                            f"{{\\c{color_tag}\\fscx112\\fscy112}}{w_item['word']}{{\\r}}"
-                        )
+                        if preset == "bold_yellow":
+                            words_formatted.append(
+                                f"{{\\c{color_tag}\\fscx114\\fscy114}}{w_item['word']}{{\\r}}"
+                            )
+                        elif preset == "minimal":
+                            # Minimal: no scale animation
+                            words_formatted.append(w_item["word"])
+                        elif preset == "boxed":
+                            words_formatted.append(
+                                f"{{\\fscx108\\fscy108}}{w_item['word']}{{\\r}}"
+                            )
+                        else:  # clean_white
+                            # Clean white: subtle scale pop without neon color shift
+                            words_formatted.append(
+                                f"{{\\fscx108\\fscy108}}{w_item['word']}{{\\r}}"
+                            )
                     else:
                         words_formatted.append(w_item["word"])
 
@@ -128,39 +185,110 @@ def generate_ass_subtitles(
     return output_ass_path
 
 
+def render_clip_single_pass(
+    video_path: str,
+    start_time: float,
+    end_time: float,
+    crop_filter: str,
+    ass_path: str,
+    output_path: str,
+    fonts_dir: str = "/usr/share/fonts",
+) -> str:
+    """Render 9:16 clip with crop, subtitles, and EBU R128 loudnorm in a single FFmpeg pass."""
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    duration = max(0.1, end_time - start_time)
+
+    # Input seeking before -i to decode only the target slice
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_time:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        video_path,
+    ]
+
+    has_ass = bool(ass_path and os.path.exists(ass_path))
+    if has_ass:
+        escaped_ass = (
+            ass_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        )
+        ass_filter = f"ass='{escaped_ass}':fontsdir='{fonts_dir}'"
+    else:
+        ass_filter = ""
+
+    # Chain crop filter and subtitle burning in a single pass
+    is_complex = (
+        ";[0:v]" in crop_filter
+        or "[top]" in crop_filter
+        or "[bottom]" in crop_filter
+        or "[v]" in crop_filter
+    )
+
+    if is_complex:
+        if has_ass:
+            base = crop_filter.rstrip(";")
+            if base.endswith("[v]"):
+                base = base[:-3] + "[v_crop]"
+            filter_complex = f"{base};[v_crop]{ass_filter}[v]"
+        else:
+            filter_complex = crop_filter
+        cmd.extend(["-filter_complex", filter_complex, "-map", "[v]", "-map", "0:a?"])
+    else:
+        if has_ass:
+            vf = f"{crop_filter},{ass_filter}" if crop_filter else ass_filter
+        else:
+            vf = crop_filter if crop_filter else "null"
+        filter_complex = f"[0:v]{vf}[v]"
+        cmd.extend(["-filter_complex", filter_complex, "-map", "[v]", "-map", "0:a?"])
+
+    # EBU R128 loudness normalization and single-pass encoding
+    cmd.extend([
+        "-af",
+        "loudnorm=I=-14:TP=-1.5:LRA=11",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        output_path,
+    ])
+
+    subprocess.run(
+        cmd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180,
+    )
+    return output_path
+
+
 def burn_subtitles(
     input_video_path: str,
     ass_path: str,
     output_video_path: str,
 ) -> str:
-    """Burn ASS subtitles into the video using FFmpeg."""
-    out_dir = os.path.dirname(output_video_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    escaped_ass = (
-        ass_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    """Legacy helper: burn subtitles into an existing video."""
+    return render_clip_single_pass(
+        video_path=input_video_path,
+        start_time=0.0,
+        end_time=999999.0,
+        crop_filter="",
+        ass_path=ass_path,
+        output_path=output_video_path,
     )
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        input_video_path,
-        "-vf",
-        f"ass='{escaped_ass}'",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-crf",
-        "20",
-        "-c:a",
-        "copy",
-        output_video_path,
-    ]
-
-    subprocess.run(
-        cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    return output_video_path

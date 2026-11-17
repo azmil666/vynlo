@@ -145,6 +145,12 @@ export default function HomePage() {
   const [url, setUrl] = useState("");
   const [layoutMode, setLayoutMode] = useState<"speaker" | "split">("speaker");
   const [maxClips, setMaxClips] = useState(3);
+  const [captionPreset, setCaptionPreset] = useState<
+    "clean_white" | "bold_yellow" | "boxed" | "minimal"
+  >("clean_white");
+  const [platformSafeZone, setPlatformSafeZone] = useState<
+    "shorts" | "reels" | "tiktok"
+  >("shorts");
   const [highlightColor, setHighlightColor] = useState("&H0000FFFF");
 
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -235,7 +241,10 @@ export default function HomePage() {
             url: url.trim(),
             layout_mode: layoutMode,
             max_clips: Number(maxClips),
-            highlight_color: highlightColor,
+            caption_preset: captionPreset,
+            platform_safe_zone: platformSafeZone,
+            highlight_color:
+              captionPreset === "bold_yellow" ? highlightColor : "&H00FFFFFF",
           }),
         });
 
@@ -257,7 +266,16 @@ export default function HomePage() {
         setIsSubmitting(false);
       }
     },
-    [url, layoutMode, maxClips, highlightColor, isSubmitting, jobState]
+    [
+      url,
+      layoutMode,
+      maxClips,
+      captionPreset,
+      platformSafeZone,
+      highlightColor,
+      isSubmitting,
+      jobState,
+    ]
   );
 
   const handleReset = useCallback(() => {
@@ -416,137 +434,229 @@ export default function HomePage() {
             </div>
 
             {/* Config Controls Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-5 pt-1">
-              {/* Layout Mode Segmented Control */}
-              <div className="space-y-2">
-                <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
-                  Layout Mode
-                </span>
-                <div
-                  role="radiogroup"
-                  aria-label="Layout Framing"
-                  className="grid grid-cols-2 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
-                >
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={layoutMode === "speaker"}
-                    onClick={() => setLayoutMode("speaker")}
-                    disabled={isSubmitting || isJobActive}
-                    className={`flex items-center justify-center gap-2 py-1.5 px-3 rounded text-xs font-medium transition-colors ${
-                      layoutMode === "speaker"
-                        ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
-                        : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
-                    }`}
+            <div className="space-y-4 pt-1">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {/* Layout Mode Segmented Control */}
+                <div className="space-y-2">
+                  <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
+                    Layout Mode
+                  </span>
+                  <div
+                    role="radiogroup"
+                    aria-label="Layout Framing"
+                    className="grid grid-cols-2 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
                   >
-                    <svg
-                      className="w-3.5 h-3.5 flex-shrink-0"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                    >
-                      <rect x="5" y="3" width="14" height="18" rx="2" />
-                      <circle cx="12" cy="10" r="3" />
-                      <path d="M7 19c0-2.5 2-4 5-4s5 1.5 5 4" />
-                    </svg>
-                    <span>Speaker</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    role="radio"
-                    aria-checked={layoutMode === "split"}
-                    onClick={() => setLayoutMode("split")}
-                    disabled={isSubmitting || isJobActive}
-                    className={`flex items-center justify-center gap-2 py-1.5 px-3 rounded text-xs font-medium transition-colors ${
-                      layoutMode === "split"
-                        ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
-                        : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
-                    }`}
-                  >
-                    <svg
-                      className="w-3.5 h-3.5 flex-shrink-0"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                    >
-                      <rect x="5" y="3" width="14" height="18" rx="2" />
-                      <line x1="5" y1="12" x2="19" y2="12" />
-                      <circle cx="15.5" cy="16.5" r="1.5" />
-                    </svg>
-                    <span>Split</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Max Clips Segmented Control */}
-              <div className="space-y-2">
-                <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
-                  Max Clips
-                </span>
-                <div
-                  role="radiogroup"
-                  aria-label="Max Clips"
-                  className="grid grid-cols-3 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
-                >
-                  {[1, 3, 5].map((num) => (
                     <button
-                      key={num}
                       type="button"
                       role="radio"
-                      aria-checked={maxClips === num}
-                      onClick={() => setMaxClips(num)}
+                      aria-checked={layoutMode === "speaker"}
+                      onClick={() => setLayoutMode("speaker")}
                       disabled={isSubmitting || isJobActive}
-                      className={`py-1.5 px-2 rounded text-xs font-mono tabular-nums transition-colors ${
-                        maxClips === num
+                      className={`flex items-center justify-center gap-2 py-1.5 px-3 rounded text-xs font-medium transition-colors ${
+                        layoutMode === "speaker"
                           ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
                           : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
                       }`}
                     >
-                      {num}
+                      <svg
+                        className="w-3.5 h-3.5 flex-shrink-0"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                      >
+                        <rect x="5" y="3" width="14" height="18" rx="2" />
+                        <circle cx="12" cy="10" r="3" />
+                        <path d="M7 19c0-2.5 2-4 5-4s5 1.5 5 4" />
+                      </svg>
+                      <span>Speaker</span>
                     </button>
-                  ))}
+
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={layoutMode === "split"}
+                      onClick={() => setLayoutMode("split")}
+                      disabled={isSubmitting || isJobActive}
+                      className={`flex items-center justify-center gap-2 py-1.5 px-3 rounded text-xs font-medium transition-colors ${
+                        layoutMode === "split"
+                          ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
+                          : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
+                      }`}
+                    >
+                      <svg
+                        className="w-3.5 h-3.5 flex-shrink-0"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                      >
+                        <rect x="5" y="3" width="14" height="18" rx="2" />
+                        <line x1="5" y1="12" x2="19" y2="12" />
+                        <circle cx="15.5" cy="16.5" r="1.5" />
+                      </svg>
+                      <span>Split</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Platform Safe Zone Toggle */}
+                <div className="space-y-2">
+                  <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
+                    Safe Zone
+                  </span>
+                  <div
+                    role="radiogroup"
+                    aria-label="Platform Safe Zone"
+                    className="grid grid-cols-3 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
+                  >
+                    {(
+                      [
+                        { id: "shorts", label: "Shorts" },
+                        { id: "reels", label: "Reels" },
+                        { id: "tiktok", label: "TikTok" },
+                      ] as const
+                    ).map(({ id, label }) => (
+                      <button
+                        key={id}
+                        type="button"
+                        role="radio"
+                        aria-checked={platformSafeZone === id}
+                        onClick={() => setPlatformSafeZone(id)}
+                        disabled={isSubmitting || isJobActive}
+                        className={`py-1.5 px-2 rounded text-xs font-medium transition-colors ${
+                          platformSafeZone === id
+                            ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
+                            : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Max Clips Segmented Control */}
+                <div className="space-y-2">
+                  <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
+                    Max Clips
+                  </span>
+                  <div
+                    role="radiogroup"
+                    aria-label="Max Clips"
+                    className="grid grid-cols-3 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
+                  >
+                    {[1, 3, 5].map((num) => (
+                      <button
+                        key={num}
+                        type="button"
+                        role="radio"
+                        aria-checked={maxClips === num}
+                        onClick={() => setMaxClips(num)}
+                        disabled={isSubmitting || isJobActive}
+                        className={`py-1.5 px-2 rounded text-xs font-mono tabular-nums transition-colors ${
+                          maxClips === num
+                            ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
+                            : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
+                        }`}
+                      >
+                        {num}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
 
-              {/* Highlight Color Picker */}
-              <div className="space-y-2">
-                <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
-                  Subtitle Highlight
-                </span>
-                <div className="flex items-center justify-between p-1 px-2 h-9 bg-black rounded-md border border-white/[0.08]">
+              {/* Subtitles & Styling Controls */}
+              <div
+                className={`grid grid-cols-1 ${
+                  captionPreset === "bold_yellow"
+                    ? "md:grid-cols-3"
+                    : "md:grid-cols-1"
+                } gap-4 items-start`}
+              >
+                {/* Caption Style Segmented Selector */}
+                <div
+                  className={`space-y-2 ${
+                    captionPreset === "bold_yellow"
+                      ? "md:col-span-2"
+                      : "w-full"
+                  }`}
+                >
+                  <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
+                    Caption Style
+                  </span>
                   <div
                     role="radiogroup"
-                    aria-label="Highlight Color"
-                    className="flex items-center gap-2"
+                    aria-label="Caption Style Preset"
+                    className="grid grid-cols-2 sm:grid-cols-4 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
                   >
-                    {HIGHLIGHT_COLORS.map((c) => {
-                      const isSelected = highlightColor === c.value;
-                      return (
-                        <button
-                          key={c.value}
-                          type="button"
-                          role="radio"
-                          aria-label={c.label}
-                          aria-checked={isSelected}
-                          onClick={() => setHighlightColor(c.value)}
-                          disabled={isSubmitting || isJobActive}
-                          className={`w-4 h-4 rounded-full transition-transform focus:outline-none ${
-                            isSelected
-                              ? "ring-1 ring-white ring-offset-2 ring-offset-[#0A0A0A] scale-110"
-                              : "opacity-75 hover:opacity-100"
-                          }`}
-                          style={{ backgroundColor: c.hex }}
-                        />
-                      );
-                    })}
+                    {(
+                      [
+                        { id: "clean_white", label: "Clean White" },
+                        { id: "bold_yellow", label: "Bold Yellow" },
+                        { id: "boxed", label: "Boxed" },
+                        { id: "minimal", label: "Minimal" },
+                      ] as const
+                    ).map(({ id, label }) => (
+                      <button
+                        key={id}
+                        type="button"
+                        role="radio"
+                        aria-checked={captionPreset === id}
+                        onClick={() => setCaptionPreset(id)}
+                        disabled={isSubmitting || isJobActive}
+                        className={`py-1.5 px-2.5 rounded text-xs font-medium text-center transition-colors ${
+                          captionPreset === id
+                            ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
+                            : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
                   </div>
-                  <span className="text-[11px] font-mono text-[#888888]">
-                    {selectedColorObj.label}
-                  </span>
                 </div>
+
+                {/* Subtitle Highlight Color Picker - ONLY shown when Bold Yellow is selected */}
+                {captionPreset === "bold_yellow" && (
+                  <div className="space-y-2">
+                    <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
+                      Highlight Accent
+                    </span>
+                    <div className="flex items-center justify-between p-1 px-3 h-[38px] bg-black rounded-md border border-white/[0.08]">
+                      <div
+                        role="radiogroup"
+                        aria-label="Highlight Color"
+                        className="flex items-center gap-2.5"
+                      >
+                        {HIGHLIGHT_COLORS.map((c) => {
+                          const isSelected = highlightColor === c.value;
+                          return (
+                            <button
+                              key={c.value}
+                              type="button"
+                              role="radio"
+                              aria-label={c.label}
+                              aria-checked={isSelected}
+                              onClick={() => setHighlightColor(c.value)}
+                              disabled={isSubmitting || isJobActive}
+                              className={`w-4 h-4 rounded-full transition-transform focus:outline-none ${
+                                isSelected
+                                  ? "ring-1 ring-white ring-offset-2 ring-offset-[#0A0A0A] scale-110"
+                                  : "opacity-75 hover:opacity-100"
+                              }`}
+                              style={{ backgroundColor: c.hex }}
+                            />
+                          );
+                        })}
+                      </div>
+                      <span className="text-[11px] font-mono text-[#888888]">
+                        {selectedColorObj.label}
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
 

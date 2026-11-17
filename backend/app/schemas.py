@@ -1,12 +1,37 @@
 from typing import Literal, Optional
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+
+ALLOWED_VIDEO_DOMAINS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+    "vimeo.com",
+    "www.vimeo.com",
+    "twitch.tv",
+    "www.twitch.tv",
+    "clips.twitch.tv",
+}
 
 
 class JobCreateRequest(BaseModel):
     url: HttpUrl
     layout_mode: Literal["speaker", "split"] = "speaker"
     max_clips: int = Field(default=3, ge=1, le=10)
-    highlight_color: str = Field(default="&H0000FFFF")
+    caption_preset: Literal["clean_white", "bold_yellow", "boxed", "minimal"] = "clean_white"
+    platform_safe_zone: Literal["shorts", "reels", "tiktok"] = "shorts"
+    highlight_color: str = Field(
+        default="&H00FFFFFF",
+        pattern=r"^&H[0-9A-Fa-f]{8}$",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: HttpUrl) -> HttpUrl:
+        host = (v.host or "").lower()
+        if host not in ALLOWED_VIDEO_DOMAINS:
+            raise ValueError("Unsupported video domain")
+        return v
 
 
 class ClipResult(BaseModel):

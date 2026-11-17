@@ -11,8 +11,8 @@ from app.schemas import JobStatusResponse
 from app.services.downloader import download_media
 from app.services.transcriber import transcribe_audio
 from app.services.analyzer import find_viral_clips
-from app.services.cropper import crop_to_vertical
-from app.services.captions import generate_ass_subtitles, burn_subtitles
+from app.services.cropper import compute_crop_filter
+from app.services.captions import generate_ass_subtitles, render_clip_single_pass
 from app.services.storage import upload_clip
 
 logger = logging.getLogger(__name__)
@@ -30,8 +30,17 @@ celery_app.conf.update(
 redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
 
 
-@celery_app.task(name="process_video_task")
-def process_video_task(job_id: str, options: dict) -> None:
+@celery_app.task(
+    name="process_video_task",
+    bind=True,
+    autoretry_for=(ConnectionError, TimeoutError),
+    retry_backoff=True,
+    max_retries=2,
+    soft_time_limit=600,
+    time_limit=660,
+    acks_late=True,
+)
+def process_video_task(self, job_id: str, options: dict) -> None:
     def update_job_state(
         status: str,
         progress: int,
@@ -84,15 +93,13 @@ def process_video_task(job_id: str, options: dict) -> None:
             current_progress = int(60 + (i - 1) * progress_step)
             update_job_state("rendering", current_progress)
 
-            raw_vertical_path = os.path.join(work_dir, f"raw_clip_{i}.mp4")
             ass_path = os.path.join(work_dir, f"clip_{i}.ass")
             final_clip_path = os.path.join(work_dir, f"final_clip_{i}.mp4")
 
-            crop_to_vertical(
+            crop_filter = compute_crop_filter(
                 video_path,
                 clip["start_time"],
                 clip["end_time"],
-                raw_vertical_path,
                 mode=options.get("layout_mode", "speaker"),
             )
             generate_ass_subtitles(
@@ -100,9 +107,18 @@ def process_video_task(job_id: str, options: dict) -> None:
                 clip["start_time"],
                 clip["end_time"],
                 ass_path,
-                highlight_color=options.get("highlight_color", "&H0000FFFF"),
+                preset=options.get("caption_preset", "clean_white"),
+                safe_zone=options.get("platform_safe_zone", "shorts"),
+                highlight_color=options.get("highlight_color", "&H00FFFFFF"),
             )
-            burn_subtitles(raw_vertical_path, ass_path, final_clip_path)
+            render_clip_single_pass(
+                video_path=video_path,
+                start_time=clip["start_time"],
+                end_time=clip["end_time"],
+                crop_filter=crop_filter,
+                ass_path=ass_path,
+                output_path=final_clip_path,
+            )
             public_url = upload_clip(final_clip_path, f"{job_id}/clip_{i}.mp4")
 
             completed_clips.append(
