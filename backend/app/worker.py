@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -8,7 +9,7 @@ import redis
 
 from app.config import settings
 from app.schemas import JobStatusResponse
-from app.services.downloader import download_media
+from app.services.downloader import download_media, get_video_metadata
 from app.services.transcriber import transcribe_audio
 from app.services.analyzer import find_viral_clips
 from app.services.cropper import compute_crop_filter
@@ -76,14 +77,61 @@ def process_video_task(self, job_id: str, options: dict) -> None:
     os.makedirs(work_dir, exist_ok=True)
 
     try:
+        url = options["url"]
+        max_clips = int(options.get("max_clips", 3))
+
+        # 1. Resolve video_id via metadata with URL hash fallback
+        try:
+            meta = get_video_metadata(url)
+            video_id = meta["video_id"]
+        except ValueError as e:
+            # Re-raise safety duration limits (e.g. > 4 hours)
+            raise
+        except Exception as e:
+            logger.warning("Metadata extraction failed for %s: %s. Using URL hash fallback.", url, e)
+            url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+            video_id = f"url:{url_hash}"
+
+        transcript_cache_key = f"cache:transcript:{video_id}"
+        candidates_cache_key = f"cache:candidates:{video_id}"
+
+        # 2. Check Redis for cached transcript
+        cached_words_raw = redis_client.get(transcript_cache_key)
+        has_cached_transcript = cached_words_raw is not None
+
+        # 3. Download media: skip audio extraction if transcript is already cached
         update_job_state("downloading", 10)
-        video_path, audio_path = download_media(options["url"], work_dir)
+        video_path, audio_path = download_media(
+            url, work_dir, extract_audio=(not has_cached_transcript)
+        )
 
+        # 4. Transcribe or load cached transcript
         update_job_state("transcribing", 30)
-        words = transcribe_audio(audio_path)
+        if has_cached_transcript and cached_words_raw:
+            logger.info("Using cached transcript for %s", video_id)
+            words = json.loads(cached_words_raw)
+        else:
+            if not audio_path:
+                _, audio_path = download_media(url, work_dir, extract_audio=True)
+            words = transcribe_audio(audio_path)
+            redis_client.set(transcript_cache_key, json.dumps(words), ex=604800)
 
+        # 5. Viral analysis or load cached candidates
         update_job_state("analyzing", 50)
-        candidates = find_viral_clips(words, max_clips=options.get("max_clips", 3))
+        cached_candidates_raw = redis_client.get(candidates_cache_key)
+        cached_candidates = None
+        if cached_candidates_raw:
+            try:
+                cached_candidates = json.loads(cached_candidates_raw)
+            except Exception:
+                cached_candidates = None
+
+        if cached_candidates and len(cached_candidates) >= max_clips:
+            logger.info("Using cached candidates for %s (found %d)", video_id, len(cached_candidates))
+            candidates = cached_candidates[:max_clips]
+        else:
+            candidates = find_viral_clips(words, max_clips=max_clips)
+            redis_client.set(candidates_cache_key, json.dumps(candidates), ex=604800)
 
         completed_clips: list[dict] = []
         total_candidates = len(candidates)
@@ -128,6 +176,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                     "virality_score": clip["virality_score"],
                     "duration": round(clip["end_time"] - clip["start_time"], 2),
                     "video_url": public_url,
+                    "is_fallback": clip.get("is_fallback", False),
                 }
             )
 

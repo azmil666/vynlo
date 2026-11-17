@@ -40,6 +40,7 @@ class ClipResult(BaseModel):
     virality_score: int
     duration: float
     video_url: str
+    is_fallback: bool = False
 
 
 class JobStatusResponse(BaseModel):

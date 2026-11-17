@@ -8,6 +8,7 @@ interface ClipResult {
   virality_score: number;
   duration: number;
   video_url: string;
+  is_fallback?: boolean;
 }
 
 interface JobStatus {
@@ -945,6 +946,11 @@ export default function HomePage() {
                         <span className={scoreColor} title="Virality Score">
                           {clip.virality_score}/100
                         </span>
+                        {clip.is_fallback && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                            Fallback
+                          </span>
+                        )}
                       </div>
                     </div>
 
