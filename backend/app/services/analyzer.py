@@ -20,6 +20,14 @@ class ClipCandidate(BaseModel):
     virality_score: int = Field(
         description="Virality score from 1 to 100", ge=1, le=100
     )
+    description: str = Field(
+        default="",
+        description="1-2 punchy sentences summarizing the hook/payoff for YouTube Shorts / Reels / TikTok captions",
+    )
+    hashtags: list[str] = Field(
+        default_factory=list,
+        description="List of 4-5 relevant lowercase tags without #",
+    )
 
 
 class ClipAnalysisResponse(BaseModel):
@@ -227,7 +235,9 @@ def _analyze_transcript_segment(words_slice: list[dict], max_clips: int = 3) -> 
         "   - 'start_time' (float, matching transcript timestamps)\n"
         "   - 'end_time' (float, matching transcript timestamps)\n"
         "   - 'title' (str, punchy 4-8 word hook title)\n"
-        "   - 'virality_score' (int, 1-100)"
+        "   - 'virality_score' (int, 1-100)\n"
+        "   - 'description' (str, 1-2 punchy sentences summarizing the hook/payoff for YouTube Shorts / Reels / TikTok captions)\n"
+        "   - 'hashtags' (list of 4-5 relevant lowercase tags without '#', e.g. [\"podcast\", \"tech\", \"ai\"])"
     )
 
     user_content = (
@@ -258,6 +268,15 @@ def _analyze_transcript_segment(words_slice: list[dict], max_clips: int = 3) -> 
                 e_time = float(item.get("end_time", 0.0))
                 title = str(item.get("title", "Viral Highlight")).strip()
                 score = int(item.get("virality_score", 70))
+                desc = str(item.get("description", "")).strip()
+                raw_tags = item.get("hashtags", [])
+                tags = [
+                    str(t).strip().lstrip("#").lower()
+                    for t in raw_tags
+                    if str(t).strip()
+                ] if isinstance(raw_tags, list) else []
+                if not tags:
+                    tags = ["shorts", "viral", "clips"]
             except (ValueError, TypeError):
                 continue
 
@@ -273,6 +292,8 @@ def _analyze_transcript_segment(words_slice: list[dict], max_clips: int = 3) -> 
                     "end_time": round(e_time, 2),
                     "title": title or "Viral Highlight",
                     "virality_score": max(1, min(100, score)),
+                    "description": desc or f"{title}. Watch this highlight from the stream.",
+                    "hashtags": tags,
                 }
             )
     except Exception as e:
@@ -294,7 +315,8 @@ def _rank_and_dedupe_clips(candidates: list[dict], max_clips: int) -> list[dict]
     for idx, c in enumerate(candidates, start=1):
         candidate_text_lines.append(
             f"Candidate {idx}: [{c['start_time']:.2f}s - {c['end_time']:.2f}s] "
-            f"Score: {c.get('virality_score', 70)} | Title: \"{c.get('title', 'Highlight')}\""
+            f"Score: {c.get('virality_score', 70)} | Title: \"{c.get('title', 'Highlight')}\" | "
+            f"Desc: \"{c.get('description', '')}\" | Tags: {c.get('hashtags', [])}"
         )
     candidate_summary = "\n".join(candidate_text_lines)
 
@@ -304,7 +326,7 @@ def _rank_and_dedupe_clips(candidates: list[dict], max_clips: int) -> list[dict]
         "Rules:\n"
         f"1. Select up to {max_clips} clips.\n"
         "2. The selected clips MUST NOT overlap with each other in time.\n"
-        "3. Preserve the exact or slightly refined start_time, end_time, title, and virality_score.\n"
+        "3. Preserve the exact or slightly refined start_time, end_time, title, virality_score, description, and hashtags.\n"
         "4. Return a JSON object with a single key 'clips'."
     )
 
@@ -320,6 +342,13 @@ def _rank_and_dedupe_clips(candidates: list[dict], max_clips: int) -> list[dict]
         parsed = []
         for item in raw_clips:
             if isinstance(item, dict):
+                desc = str(item.get("description", "")).strip()
+                raw_tags = item.get("hashtags", [])
+                tags = [
+                    str(t).strip().lstrip("#").lower()
+                    for t in raw_tags
+                    if str(t).strip()
+                ] if isinstance(raw_tags, list) else []
                 parsed.append(
                     {
                         "start_time": float(item.get("start_time", 0.0)),
@@ -327,6 +356,8 @@ def _rank_and_dedupe_clips(candidates: list[dict], max_clips: int) -> list[dict]
                         "title": str(item.get("title", "Viral Highlight")).strip()
                         or "Viral Highlight",
                         "virality_score": int(item.get("virality_score", 70)),
+                        "description": desc or "Watch this highlight from the stream.",
+                        "hashtags": tags or ["shorts", "viral", "clips"],
                     }
                 )
         if parsed:
@@ -348,6 +379,8 @@ def find_viral_clips(words: list[dict], max_clips: int = 3) -> list[dict]:
                 "end_time": 0.0,
                 "title": "Default Clip",
                 "virality_score": 50,
+                "description": "Watch this engaging moment extracted from the stream.",
+                "hashtags": ["shorts", "viral", "clips"],
                 "is_fallback": True,
             }
         ]
@@ -407,6 +440,11 @@ def find_viral_clips(words: list[dict], max_clips: int = 3) -> list[dict]:
                 "end_time": snapped_end,
                 "title": clip["title"],
                 "virality_score": clip["virality_score"],
+                "description": clip.get(
+                    "description",
+                    f"{clip['title']}. Watch this highlight from the stream.",
+                ),
+                "hashtags": clip.get("hashtags", ["shorts", "viral", "clips"]),
                 "is_fallback": False,
             }
         )
@@ -427,6 +465,8 @@ def find_viral_clips(words: list[dict], max_clips: int = 3) -> list[dict]:
                 "end_time": snapped_end,
                 "title": "Engaging Highlight",
                 "virality_score": 85,
+                "description": "Watch this engaging moment extracted from the stream.",
+                "hashtags": ["shorts", "viral", "clips"],
                 "is_fallback": True,
             }
         ]

@@ -23,6 +23,27 @@ def _format_ass_time(seconds: float) -> str:
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
+def _wrap_hook_title(title: str, max_chars: int = 28) -> str:
+    """Wrap hook title with ASS newline tags if longer than max_chars."""
+    words = title.strip().upper().split()
+    if not words:
+        return ""
+    lines: list[str] = []
+    current_line: list[str] = []
+    current_len = 0
+    for w in words:
+        if current_line and (current_len + 1 + len(w)) > max_chars:
+            lines.append(" ".join(current_line))
+            current_line = [w]
+            current_len = len(w)
+        else:
+            current_line.append(w)
+            current_len += len(w) + (1 if len(current_line) > 1 else 0)
+    if current_line:
+        lines.append(" ".join(current_line))
+    return r"\N".join(lines)
+
+
 def generate_ass_subtitles(
     words: list[dict],
     start_time: float,
@@ -31,6 +52,8 @@ def generate_ass_subtitles(
     preset: str = "clean_white",
     safe_zone: str = "shorts",
     highlight_color: str = "&H00FFFFFF",
+    hook_title: str | None = None,
+    show_hook_banner: bool = True,
 ) -> str:
     """Generate dynamic ASS subtitle file with presets and safe zones."""
     out_dir = os.path.dirname(output_ass_path)
@@ -84,7 +107,9 @@ def generate_ass_subtitles(
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font_name},{font_size},{primary_color},&H0000FFFF,{outline_color},{back_color},"
-        f"-1,0,0,0,100,100,0,0,{border_style},{outline},{shadow},2,60,60,{margin_v},1\n\n"
+        f"-1,0,0,0,100,100,0,0,{border_style},{outline},{shadow},2,60,60,{margin_v},1\n"
+        f"Style: HookBanner,{font_name},54,&H00FFFFFF,&H0000FFFF,&H00000000,&HCC000000,"
+        "-1,0,0,0,100,100,0,0,3,14,0,8,80,80,190,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -177,6 +202,13 @@ def generate_ass_subtitles(
                     f"Dialogue: 0,{_format_ass_time(event_start)},{_format_ass_time(event_end)},"
                     f"Default,,0,0,0,,{text_payload}"
                 )
+
+    if show_hook_banner and hook_title and hook_title.strip():
+        wrapped_hook = _wrap_hook_title(hook_title.strip(), max_chars=28)
+        dialogue_lines.insert(
+            0,
+            f"Dialogue: 1,0:00:00.00,0:00:03.20,HookBanner,,0,0,0,,{wrapped_hook}",
+        )
 
     content = header + "\n".join(dialogue_lines) + "\n"
     with open(output_ass_path, "w", encoding="utf-8") as f:

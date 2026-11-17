@@ -158,6 +158,8 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 preset=options.get("caption_preset", "clean_white"),
                 safe_zone=options.get("platform_safe_zone", "shorts"),
                 highlight_color=options.get("highlight_color", "&H00FFFFFF"),
+                hook_title=clip.get("title"),
+                show_hook_banner=options.get("show_hook_banner", True),
             )
             render_clip_single_pass(
                 video_path=video_path,
@@ -177,6 +179,8 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                     "duration": round(clip["end_time"] - clip["start_time"], 2),
                     "video_url": public_url,
                     "is_fallback": clip.get("is_fallback", False),
+                    "description": clip.get("description", ""),
+                    "hashtags": clip.get("hashtags", []),
                 }
             )
 

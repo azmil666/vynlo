@@ -9,6 +9,8 @@ interface ClipResult {
   duration: number;
   video_url: string;
   is_fallback?: boolean;
+  description?: string;
+  hashtags?: string[];
 }
 
 interface JobStatus {
@@ -153,6 +155,7 @@ export default function HomePage() {
     "shorts" | "reels" | "tiktok"
   >("shorts");
   const [highlightColor, setHighlightColor] = useState("&H0000FFFF");
+  const [showHookBanner, setShowHookBanner] = useState(true);
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -246,6 +249,7 @@ export default function HomePage() {
             platform_safe_zone: platformSafeZone,
             highlight_color:
               captionPreset === "bold_yellow" ? highlightColor : "&H00FFFFFF",
+            show_hook_banner: showHookBanner,
           }),
         });
 
@@ -274,6 +278,7 @@ export default function HomePage() {
       captionPreset,
       platformSafeZone,
       highlightColor,
+      showHookBanner,
       isSubmitting,
       jobState,
     ]
@@ -523,8 +528,8 @@ export default function HomePage() {
                 </p>
               </div>
 
-              {/* Safe Zone & Max Clips Row */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* Safe Zone, Max Clips & Hook Banner Row */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 {/* Platform Safe Zone Toggle */}
                 <div className="space-y-2">
                   <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
@@ -589,6 +594,43 @@ export default function HomePage() {
                       </button>
                     ))}
                   </div>
+                </div>
+
+                {/* 3s Hook Banner Toggle */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
+                      Hook Banner
+                    </span>
+                    <span className="text-[10px] font-mono text-[#666666]">
+                      3.2s
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={showHookBanner}
+                    onClick={() => setShowHookBanner(!showHookBanner)}
+                    disabled={isSubmitting || isJobActive}
+                    className={`w-full h-[38px] px-3 rounded-md border flex items-center justify-between text-xs font-medium transition-colors ${
+                      showHookBanner
+                        ? "bg-[#111111] text-[#EDEDED] border-white/[0.16]"
+                        : "bg-black text-[#888888] border-white/[0.08] hover:text-[#EDEDED]"
+                    }`}
+                  >
+                    <span className="truncate">Top Hook Pill</span>
+                    <span
+                      className={`relative inline-flex h-4 w-7 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out ${
+                        showHookBanner ? "bg-white" : "bg-white/20"
+                      }`}
+                    >
+                      <span
+                        className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-black shadow-lg ring-0 transition duration-200 ease-in-out ${
+                          showHookBanner ? "translate-x-3" : "translate-x-0"
+                        }`}
+                      />
+                    </span>
+                  </button>
                 </div>
               </div>
 
@@ -908,14 +950,49 @@ export default function HomePage() {
                 {jobState?.clips?.length ?? 0}
               </span>
             </div>
+
+            {jobState?.status === "completed" &&
+              jobState.clips &&
+              jobState.clips.length > 0 && (
+                <a
+                  href={`${API_BASE_URL}/api/jobs/${jobState.job_id}/download-all`}
+                  download={`clips_${jobState.job_id}.zip`}
+                  className="h-7 px-2.5 rounded text-xs font-mono text-[#EDEDED] bg-white/[0.08] hover:bg-white/[0.12] border border-white/[0.12] transition-colors flex items-center gap-1.5"
+                >
+                  <svg
+                    className="w-3.5 h-3.5"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                  >
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="7 10 12 15 17 10" />
+                    <line x1="12" y1="15" x2="12" y2="3" />
+                  </svg>
+                  <span>Download All (.ZIP)</span>
+                </a>
+              )}
           </div>
 
           {jobState && jobState.clips && jobState.clips.length > 0 ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {jobState.clips.map((clip, idx) => {
                 const resolvedUrl = resolveVideoUrl(clip.video_url);
-                const isTitleCopied = copiedKeys[`${clip.clip_id}-title`];
+                const isCaptionCopied = copiedKeys[`${clip.clip_id}-caption`];
                 const isLinkCopied = copiedKeys[`${clip.clip_id}-link`];
+
+                const captionText = [
+                  clip.title,
+                  clip.description,
+                  clip.hashtags && clip.hashtags.length > 0
+                    ? clip.hashtags
+                        .map((t) => `#${t.replace(/^#/, "")}`)
+                        .join(" ")
+                    : "",
+                ]
+                  .filter(Boolean)
+                  .join("\n\n");
 
                 const scoreColor =
                   clip.virality_score >= 80
@@ -965,17 +1042,37 @@ export default function HomePage() {
                       />
                     </div>
 
+                    {/* Social Kit: Description & Hashtags */}
+                    {(clip.description ||
+                      (clip.hashtags && clip.hashtags.length > 0)) && (
+                      <div className="p-3 bg-black/40 border-t border-white/[0.04] space-y-1.5 text-left">
+                        {clip.description && (
+                          <p className="line-clamp-2 text-xs text-[#888888] leading-relaxed">
+                            {clip.description}
+                          </p>
+                        )}
+                        {clip.hashtags && clip.hashtags.length > 0 && (
+                          <p className="font-mono text-[11px] text-[#666666] truncate">
+                            {clip.hashtags
+                              .map((t) => `#${t.replace(/^#/, "")}`)
+                              .join(" ")}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
                     {/* Footer Action Bar */}
                     <div className="px-3 h-9 border-t border-white/[0.08] flex items-center justify-between text-xs">
                       <div className="flex items-center gap-1">
                         <button
                           type="button"
                           onClick={() =>
-                            handleCopy(`${clip.clip_id}-title`, clip.title)
+                            handleCopy(`${clip.clip_id}-caption`, captionText)
                           }
+                          title="Copy title, description, and hashtags"
                           className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors"
                         >
-                          {isTitleCopied ? "Copied" : "Copy Title"}
+                          {isCaptionCopied ? "Copied" : "Copy Caption"}
                         </button>
 
                         <button

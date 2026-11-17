@@ -24,6 +24,7 @@ class JobCreateRequest(BaseModel):
         default="&H00FFFFFF",
         pattern=r"^&H[0-9A-Fa-f]{8}$",
     )
+    show_hook_banner: bool = True
 
     @field_validator("url")
     @classmethod
@@ -41,6 +42,8 @@ class ClipResult(BaseModel):
     duration: float
     video_url: str
     is_fallback: bool = False
+    description: str = ""
+    hashtags: list[str] = Field(default_factory=list)
 
 
 class JobStatusResponse(BaseModel):
