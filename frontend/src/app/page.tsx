@@ -435,71 +435,95 @@ export default function HomePage() {
 
             {/* Config Controls Grid */}
             <div className="space-y-4 pt-1">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                {/* Layout Mode Segmented Control */}
-                <div className="space-y-2">
-                  <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
-                    Layout Mode
-                  </span>
-                  <div
-                    role="radiogroup"
-                    aria-label="Layout Framing"
-                    className="grid grid-cols-2 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
+              {/* Layout Mode Segmented Control */}
+              <div className="space-y-2">
+                <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
+                  Layout Framing
+                </span>
+                <div
+                  role="radiogroup"
+                  aria-label="Layout Framing"
+                  className="grid grid-cols-1 sm:grid-cols-2 p-1 bg-black rounded-md border border-white/[0.08] gap-1"
+                >
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={layoutMode === "speaker"}
+                    onClick={() => setLayoutMode("speaker")}
+                    disabled={isSubmitting || isJobActive}
+                    className={`flex items-start gap-3 p-2.5 rounded text-left transition-colors ${
+                      layoutMode === "speaker"
+                        ? "bg-[#111111] text-[#EDEDED] border border-white/[0.24]"
+                        : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
+                    }`}
                   >
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-checked={layoutMode === "speaker"}
-                      onClick={() => setLayoutMode("speaker")}
-                      disabled={isSubmitting || isJobActive}
-                      className={`flex items-center justify-center gap-2 py-1.5 px-3 rounded text-xs font-medium transition-colors ${
-                        layoutMode === "speaker"
-                          ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
-                          : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
+                    <svg
+                      className={`w-3.5 h-3.5 flex-shrink-0 mt-0.5 ${
+                        layoutMode === "speaker" ? "text-white" : "text-[#888888]"
                       }`}
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
                     >
-                      <svg
-                        className="w-3.5 h-3.5 flex-shrink-0"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.8"
-                      >
-                        <rect x="5" y="3" width="14" height="18" rx="2" />
-                        <circle cx="12" cy="10" r="3" />
-                        <path d="M7 19c0-2.5 2-4 5-4s5 1.5 5 4" />
-                      </svg>
-                      <span>Speaker</span>
-                    </button>
+                      <rect x="5" y="3" width="14" height="18" rx="2" />
+                      <circle cx="12" cy="10" r="3" />
+                      <path d="M7 19c0-2.5 2-4 5-4s5 1.5 5 4" />
+                    </svg>
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-xs font-medium text-[#EDEDED]">
+                        Smart Face Crop
+                      </span>
+                      <span className="text-[11px] text-[#888888] leading-tight">
+                        Podcasts, interviews & talking heads
+                      </span>
+                    </div>
+                  </button>
 
-                    <button
-                      type="button"
-                      role="radio"
-                      aria-checked={layoutMode === "split"}
-                      onClick={() => setLayoutMode("split")}
-                      disabled={isSubmitting || isJobActive}
-                      className={`flex items-center justify-center gap-2 py-1.5 px-3 rounded text-xs font-medium transition-colors ${
-                        layoutMode === "split"
-                          ? "bg-[#111111] text-[#EDEDED] border border-white/[0.16]"
-                          : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={layoutMode === "split"}
+                    onClick={() => setLayoutMode("split")}
+                    disabled={isSubmitting || isJobActive}
+                    className={`flex items-start gap-3 p-2.5 rounded text-left transition-colors ${
+                      layoutMode === "split"
+                        ? "bg-[#111111] text-[#EDEDED] border border-white/[0.24]"
+                        : "text-[#888888] hover:text-[#EDEDED] border border-transparent"
+                    }`}
+                  >
+                    <svg
+                      className={`w-3.5 h-3.5 flex-shrink-0 mt-0.5 ${
+                        layoutMode === "split" ? "text-white" : "text-[#888888]"
                       }`}
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
                     >
-                      <svg
-                        className="w-3.5 h-3.5 flex-shrink-0"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.8"
-                      >
-                        <rect x="5" y="3" width="14" height="18" rx="2" />
-                        <line x1="5" y1="12" x2="19" y2="12" />
-                        <circle cx="15.5" cy="16.5" r="1.5" />
-                      </svg>
-                      <span>Split</span>
-                    </button>
-                  </div>
+                      <rect x="5" y="3" width="14" height="18" rx="2" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                      <circle cx="15.5" cy="16.5" r="1.5" />
+                    </svg>
+                    <div className="flex flex-col gap-0.5">
+                      <span className="text-xs font-medium text-[#EDEDED]">
+                        Split Screen
+                      </span>
+                      <span className="text-[11px] text-[#888888] leading-tight">
+                        Gaming & streams with corner facecam
+                      </span>
+                    </div>
+                  </button>
                 </div>
+                <p className="text-xs text-[#666666] font-mono">
+                  {layoutMode === "speaker"
+                    ? "Tracks speaker face dynamically across 9:16 full-screen frame."
+                    : "Stacks gameplay center-crop (top) over bottom-right facecam (bottom)."}
+                </p>
+              </div>
 
+              {/* Safe Zone & Max Clips Row */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 {/* Platform Safe Zone Toggle */}
                 <div className="space-y-2">
                   <span className="block text-xs uppercase tracking-wider font-mono text-[#888888]">
