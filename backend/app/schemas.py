@@ -61,6 +61,18 @@ class SourceInfo(BaseModel):
     sar: str = "1:1"
     avg_fps: float = 30.0
     is_vfr: bool = False
+    timeline_offset: float = 0.0
+
+
+class TranscriptValidation(BaseModel):
+    """Quality and validation metrics computed for a generated transcript."""
+    word_count: int
+    speech_duration: float
+    speech_coverage_ratio: float
+    words_per_minute: float
+    language: str = "en"
+    language_probability: float = 1.0
+    model: str = "base"
 
 
 class PipelineError(ValueError):

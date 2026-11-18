@@ -225,7 +225,11 @@ def process_video_task(self, job_id: str, options: dict) -> None:
         update_job_state("transcribing", 30)
         if has_cached_transcript and cached_words_raw:
             logger.info("Using cached transcript for %s", video_id)
-            words = json.loads(cached_words_raw)
+            cached_data = json.loads(cached_words_raw)
+            if isinstance(cached_data, dict) and "words" in cached_data:
+                words = cached_data["words"]
+            else:
+                words = cached_data
         else:
             if not audio_path:
                 audio_path = os.path.join(work_dir, "audio.wav")
@@ -246,8 +250,21 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 subprocess.run(
                     cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
-            words = transcribe_audio(audio_path)
-            r.set(transcript_cache_key, json.dumps(words), ex=604800)
+            words = transcribe_audio(
+                audio_path,
+                timeline_offset=source_info.timeline_offset if source_info else 0.0,
+                media_duration=source_info.duration if source_info else None,
+            )
+            validation_dict = (
+                words.validation.model_dump()
+                if hasattr(words, "validation") and hasattr(words.validation, "model_dump")
+                else {}
+            )
+            r.set(
+                transcript_cache_key,
+                json.dumps({"words": words, "validation": validation_dict}),
+                ex=604800,
+            )
 
         # 5. Viral analysis or load cached candidates
         update_job_state("analyzing", 50)

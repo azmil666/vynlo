@@ -11,7 +11,14 @@ from app.services.downloader import (
     validate_downloaded_media,
 )
 from app.services.storage import upload_clip
-from app.services.transcriber import transcribe_audio
+from app.services.transcriber import (
+    compute_transcript_validation,
+    get_whisper_model,
+    is_silence_hallucination_text,
+    normalize_words,
+    set_whisper_model,
+    transcribe_audio,
+)
 
 __all__ = [
     "classify_ytdlp_error",
@@ -20,6 +27,11 @@ __all__ = [
     "get_video_metadata",
     "validate_downloaded_media",
     "transcribe_audio",
+    "get_whisper_model",
+    "set_whisper_model",
+    "normalize_words",
+    "is_silence_hallucination_text",
+    "compute_transcript_validation",
     "find_viral_clips",
     "crop_to_vertical",
     "compute_crop_filter",

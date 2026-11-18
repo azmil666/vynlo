@@ -38,6 +38,20 @@ class Settings(BaseSettings):
     LONG_VIDEO_MAX_HEIGHT: int = 720
     DURATION_TOLERANCE_SECONDS: float = 15.0
 
+    # Faster-Whisper ASR configuration
+    WHISPER_MODEL_SIZE: str = "base"
+    WHISPER_DEVICE: str = "cpu"
+    WHISPER_COMPUTE_TYPE: str = "int8"
+    WHISPER_LANGUAGE: Optional[str] = None  # None = auto-detect
+    WHISPER_BEAM_SIZE: int = 5
+    WHISPER_VAD_FILTER: bool = True
+    WHISPER_VAD_MIN_SILENCE_DURATION_MS: int = 500
+    WHISPER_VAD_SPEECH_PAD_MS: int = 400
+    WHISPER_NO_SPEECH_THRESHOLD: float = 0.6
+    WHISPER_COMPRESSION_RATIO_THRESHOLD: float = 2.4
+    WHISPER_MIN_SPEECH_COVERAGE: float = 0.04  # 4% minimum speech coverage
+    WHISPER_MIN_WORD_COUNT: int = 5
+
     @property
     def task_soft_time_limit(self) -> int:
         """Derived task soft time limit based on stage budgets and video length.

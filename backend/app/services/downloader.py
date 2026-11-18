@@ -394,7 +394,18 @@ def validate_downloaded_media(
     r_fps_str = str(video_stream.get("r_frame_rate", "") or "")
     is_vfr = bool(r_fps_str and raw_fps and r_fps_str != raw_fps)
 
+    # Timeline offset check (audio vs video presentation start time)
+    format_start = float(probe_data.get("format", {}).get("start_time", 0) or 0)
+    video_start = float(video_stream.get("start_time", format_start) or format_start or 0.0)
+    audio_start = float(audio_stream.get("start_time", format_start) or format_start or 0.0)
+    timeline_offset = round(audio_start - video_start, 4)
+
     warnings: list[dict] = []
+    if abs(timeline_offset) > 0.02:
+        warnings.append({
+            "code": "AUDIO_TIMELINE_OFFSET",
+            "message": f"Audio track has {timeline_offset:+.3f}s start offset relative to video timeline.",
+        })
     if rotation != 0:
         warnings.append({
             "code": "ROTATED_SOURCE_VIDEO",
@@ -420,6 +431,7 @@ def validate_downloaded_media(
         sar=sar,
         avg_fps=avg_fps,
         is_vfr=is_vfr,
+        timeline_offset=timeline_offset,
     )
     return source_info, warnings
 
