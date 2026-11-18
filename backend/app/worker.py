@@ -285,15 +285,17 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             logger.info("Using cached candidates for %s (found %d)", video_id, len(cached_candidates))
             candidates = cached_candidates[:max_clips]
         else:
-            candidates = find_viral_clips(words, max_clips=max_clips)
-            has_fallback = any(c.get("is_fallback") for c in candidates)
+            superset_target = max(max_clips, settings.ANALYSIS_SUPERSET_SIZE)
+            all_candidates = find_viral_clips(words, max_clips=superset_target)
+            has_fallback = any(c.get("is_fallback") for c in all_candidates)
             if not has_fallback:
-                r.set(candidates_cache_key, json.dumps(candidates), ex=604800)
+                r.set(candidates_cache_key, json.dumps(all_candidates), ex=604800)
             else:
                 logger.info(
                     "Skipping candidate caching for %s: candidates contain fallback clips",
                     video_id,
                 )
+            candidates = all_candidates[:max_clips]
 
         completed_clips: list[dict] = []
         total_candidates = len(candidates)

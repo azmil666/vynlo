@@ -2,10 +2,15 @@
 
 from app.services.analyzer import (
     build_transcript_segments,
+    candidate_rank_key,
     classify_llm_error,
+    compute_rubric_score,
+    compute_text_similarity,
+    compute_time_overlap,
     find_viral_clips,
     sanitize_clip_text,
     validate_llm_config,
+    _dedupe_and_rank_candidates,
 )
 from app.services.captions import burn_subtitles, generate_ass_subtitles, render_clip_single_pass
 from app.services.cropper import crop_to_vertical, compute_crop_filter

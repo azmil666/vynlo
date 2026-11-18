@@ -15,6 +15,18 @@ class Settings(BaseSettings):
     MAX_CLIP_DURATION_SECONDS: float = 60.0
     MIN_HASHTAGS_COUNT: int = 2
     MAX_HASHTAGS_COUNT: int = 8
+
+    # LLM Analysis Windowing, Ranking & Superset Caching
+    ANALYSIS_USE_WINDOWING: bool = False
+    WINDOWING_THRESHOLD_SECONDS: float = 900.0
+    WINDOW_SIZE_SECONDS: float = 600.0
+    WINDOW_OVERLAP_MARGIN_SECONDS: float = 15.0
+    WINDOW_OVERLAP_SECONDS: float = 75.0
+    ANALYSIS_SUPERSET_SIZE: int = 10
+    MIN_VIRALITY_SCORE: int = 60
+    DEDUPE_IOU_THRESHOLD: float = 0.3
+    DEDUPE_MIN_OVERLAP_RATIO: float = 0.5
+    DEDUPE_TEXT_SIMILARITY_THRESHOLD: float = 0.7
     TEMP_DIR: str = "/tmp/clipper"
     STATIC_DIR: str = "/app/static"
     PUBLIC_BASE_URL: str = "http://localhost:8000"
