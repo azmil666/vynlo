@@ -6,9 +6,15 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     REDIS_URL: str = "redis://redis:6379/0"
+    # LLM Provider configuration
+    LLM_PROVIDER: str = "gemini"  # "gemini" or "openai"
     LLM_API_KEY: str = ""
-    LLM_MODEL: str = "gemini-3.8-flash"
-    GEMINI_MODEL: str = "gemini-3.8-flash"
+    LLM_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    MIN_CLIP_DURATION_SECONDS: float = 5.0
+    MAX_CLIP_DURATION_SECONDS: float = 60.0
+    MIN_HASHTAGS_COUNT: int = 2
+    MAX_HASHTAGS_COUNT: int = 8
     TEMP_DIR: str = "/tmp/clipper"
     STATIC_DIR: str = "/app/static"
     PUBLIC_BASE_URL: str = "http://localhost:8000"

@@ -43,6 +43,14 @@ async def lifespan(app: FastAPI):
             logger.info("Cleaned %d stale temp directories on startup", len(cleaned))
     except Exception as e:
         logger.warning("Startup stale temp cleanup failed: %s", e)
+
+    # Validate LLM configuration on startup
+    try:
+        from app.services.analyzer import validate_llm_config
+        validate_llm_config()
+    except Exception as e:
+        logger.warning("LLM configuration validation warning on startup: %s", e)
+
     yield
 
 
