@@ -25,6 +25,7 @@ interface ClipResult {
   description?: string;
   hashtags?: string[];
   selection_method?: "llm" | "heuristic";
+  selection_reason?: string;
   layout_used?: "speaker" | "split";
   detector?: string;
   caption_font?: string;
@@ -1051,9 +1052,12 @@ export default function HomePage() {
                         <span className={scoreColor} title="Virality Score">
                           {clip.virality_score}/100
                         </span>
-                        {clip.is_fallback && (
-                          <span className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                            Fallback
+                        {(clip.selection_method === "heuristic" || clip.is_fallback) && (
+                          <span
+                            className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                            title={clip.selection_reason || "Selected via heuristic fallback"}
+                          >
+                            Heuristic
                           </span>
                         )}
                       </div>

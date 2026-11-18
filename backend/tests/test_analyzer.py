@@ -262,11 +262,16 @@ def test_untrusted_transcript_prompt_injection_defense(sample_words):
 
 def test_provider_failures_raise_without_fallback(sample_words):
     """Verify provider failures raise typed PipelineError and never invoke silent heuristic fallbacks."""
-    # 1. 429 RateLimit -> retries then raises LLM_UNAVAILABLE if persistent
+    # 1. 429 RateLimit -> retries then raises LLM_UNAVAILABLE if persistent and heuristic fallback disabled
     fake_llm_rate = FakeLLM([Exception("429 Too Many Requests"), Exception("429 Too Many Requests")])
     with patch("time.sleep"):
         with pytest.raises(PipelineError) as exc_info:
-            find_viral_clips(sample_words, max_clips=1, llm_client=fake_llm_rate)
+            find_viral_clips(
+                sample_words,
+                max_clips=1,
+                llm_client=fake_llm_rate,
+                allow_heuristic_fallback=False,
+            )
         assert exc_info.value.code == PipelineErrorCode.LLM_UNAVAILABLE
         assert exc_info.value.retryable is True
 

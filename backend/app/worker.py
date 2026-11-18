@@ -280,14 +280,17 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             cached_candidates
             and isinstance(cached_candidates, list)
             and len(cached_candidates) >= max_clips
-            and not any(c.get("is_fallback") for c in cached_candidates)
+            and not any(c.get("is_fallback") or c.get("selection_method") == "heuristic" for c in cached_candidates)
         ):
             logger.info("Using cached candidates for %s (found %d)", video_id, len(cached_candidates))
             candidates = cached_candidates[:max_clips]
         else:
             superset_target = max(max_clips, settings.ANALYSIS_SUPERSET_SIZE)
             all_candidates = find_viral_clips(words, max_clips=superset_target)
-            has_fallback = any(c.get("is_fallback") for c in all_candidates)
+            has_fallback = any(
+                c.get("is_fallback") or c.get("selection_method") == "heuristic"
+                for c in all_candidates
+            )
             if not has_fallback:
                 r.set(candidates_cache_key, json.dumps(all_candidates), ex=604800)
             else:
@@ -296,6 +299,14 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                     video_id,
                 )
             candidates = all_candidates[:max_clips]
+
+        if len(candidates) < max_clips:
+            warnings_list.append(
+                {
+                    "code": "FEWER_CLIPS_THAN_REQUESTED",
+                    "message": f"Only {len(candidates)} qualifying clips found (requested {max_clips}).",
+                }
+            )
 
         for clip in candidates:
             for w in clip.get("warnings", []):
@@ -352,12 +363,17 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             )
             public_url = upload_clip(final_clip_path, f"{job_id}/clip_{i}.mp4")
 
-            is_fb = bool(clip.get("is_fallback", False))
+            is_fb = bool(
+                clip.get("is_fallback", False)
+                or clip.get("selection_method") == "heuristic"
+            )
+            sel_method = clip.get("selection_method", "heuristic" if is_fb else "llm")
+            sel_reason = clip.get("selection_reason")
             if is_fb:
                 warnings_list.append(
                     {
                         "code": "HEURISTIC_FALLBACK_CLIP",
-                        "message": f"Clip {i} generated using heuristic spacing due to insufficient viral hooks.",
+                        "message": sel_reason or f"Clip {i} generated using heuristic transcript selection.",
                         "clip_index": i,
                     }
                 )
@@ -370,9 +386,10 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                     "duration": round(clip["end_time"] - clip["start_time"], 2),
                     "video_url": public_url,
                     "is_fallback": is_fb,
+                    "selection_method": sel_method,
+                    "selection_reason": sel_reason,
                     "description": clip.get("description", ""),
                     "hashtags": clip.get("hashtags", []),
-                    "selection_method": "heuristic" if is_fb else "llm",
                     "layout_used": layout_mode,
                     "detector": detector_name,
                     "caption_font": "Liberation Sans",

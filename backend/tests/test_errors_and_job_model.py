@@ -245,7 +245,8 @@ class TestJobStatusSerializationAndRoundTrip:
         assert len(parsed.clips) == 1
         clip = parsed.clips[0]
         assert clip.clip_id == "clip_old"
-        assert clip.selection_method == "llm"
+        assert clip.selection_method == "heuristic"
+        assert clip.is_fallback is True
         assert clip.layout_used == "speaker"
         assert clip.detector == "yunet"
         assert clip.caption_font == "Liberation Sans"

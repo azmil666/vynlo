@@ -834,6 +834,8 @@ def validate_and_convert_clips(
             "hook": sanitize_clip_text(item.hook),
             "virality_score": score,
             "score_breakdown": breakdown,
+            "selection_method": "llm",
+            "selection_reason": "Selected by LLM based on narrative viral potential",
             "description": desc,
             "hashtags": tags,
             "is_fallback": False,
@@ -968,80 +970,178 @@ def _rank_and_dedupe_clips(
     return _dedupe_and_rank_candidates(candidates, max_clips=max_clips)
 
 
-def _generate_fallback_segments(
-    words: list[dict],
-    min_start: float,
-    total_duration: float,
-    max_clips: int,
-    existing_clips: list[dict] | None = None,
-) -> list[dict]:
-    """Generate non-overlapping fallback clips evenly spaced across video duration."""
-    content_dur = max(0.0, total_duration - min_start)
-    clips: list[dict] = list(existing_clips or [])
+def score_heuristic_window(
+    segments: list[TranscriptSegment], duration: float
+) -> tuple[float, dict[str, float], str]:
+    """Score a candidate transcript window based on speech density, markers, clean start, and self-containment.
 
-    if content_dur <= 90.0:
-        if not clips:
-            fallback_duration = min(45.0, max(5.0, content_dur))
-            fallback_end = min_start + fallback_duration
-            if fallback_end <= min_start:
-                fallback_end = total_duration
-            snapped_start, snapped_end = _snap_boundaries(min_start, fallback_end, words)
-            clips.append(
-                {
-                    "start_time": snapped_start,
-                    "end_time": snapped_end,
-                    "title": "Engaging Highlight",
-                    "virality_score": 85,
-                    "description": "Watch this engaging moment extracted from the stream.",
-                    "hashtags": ["shorts", "viral", "clips"],
-                    "is_fallback": True,
-                }
-            )
-        return clips
+    Returns:
+        (total_score, score_breakdown, selection_reason)
+    """
+    if not segments or duration <= 0:
+        return 0.0, {}, "Invalid segment window"
 
-    if max_clips == 1:
-        fractions = [0.25]
-    elif max_clips == 2:
-        fractions = [0.20, 0.70]
-    elif max_clips == 3:
-        fractions = [0.15, 0.50, 0.80]
+    total_words = sum(len(s.text.split()) for s in segments)
+    wpm = (total_words / duration) * 60.0
+
+    # 1. Speech Density (up to 25.0 points)
+    # Engaging conversational speech is typically 120-190 WPM.
+    if 120.0 <= wpm <= 190.0:
+        density_score = 25.0
+    elif (90.0 <= wpm < 120.0) or (190.0 < wpm <= 230.0):
+        density_score = 16.0
+    elif (60.0 <= wpm < 90.0) or (230.0 < wpm <= 270.0):
+        density_score = 8.0
     else:
-        fractions = [round((i + 0.5) / max_clips, 2) for i in range(max_clips)]
+        density_score = 2.0
 
-    target_duration = 35.0
+    # 2. Question / Exclamation Markers & Hook Keywords (up to 25.0 points)
+    full_text = " ".join(s.text for s in segments)
+    first_text = segments[0].text
+    marker_score = 0.0
+    if "?" in full_text:
+        marker_score += 8.0
+    if "!" in full_text:
+        marker_score += 6.0
+    if "?" in first_text or "!" in first_text:
+        marker_score += 4.0
 
-    for frac in fractions:
-        if len(clips) >= max_clips:
-            break
-        raw_start = min_start + frac * content_dur
-        raw_end = min(total_duration, raw_start + target_duration)
-        if (raw_end - raw_start) < 20.0 and (raw_start - target_duration >= min_start):
-            raw_start = max(min_start, raw_end - target_duration)
+    hook_keywords = {
+        "why", "how", "what", "secret", "never", "always", "best", "worst",
+        "stop", "incredible", "crazy", "truth", "mistake", "tip", "reason",
+        "actually", "discover", "watch", "look", "key", "remember",
+    }
+    first_seg_tokens = segments[0].text.strip().split()
+    first_words = {
+        w.lower().strip(".,!?:;\"'()[]{}")
+        for w in first_seg_tokens[:6]
+    }
+    if first_words & hook_keywords:
+        marker_score += 7.0
+    marker_score = min(25.0, marker_score)
 
-        snapped_start, snapped_end = _snap_boundaries(raw_start, raw_end, words)
-        if (snapped_end - snapped_start) < 5.0:
-            continue
+    # 3. Absence of Leading Filler / Low-energy starts (up to 25.0 points)
+    first_w = ""
+    if first_seg_tokens:
+        first_w = first_seg_tokens[0].lower().strip(".,!?:;\"'()[]{}")
 
-        overlaps = any(
-            (snapped_start < c["end_time"] and snapped_end > c["start_time"])
-            for c in clips
-        )
+    filler_hard = {"um", "uh", "ah", "like"}
+    filler_soft = {"so", "yeah", "okay", "well", "right", "anyway", "basically"}
+    if first_w in filler_hard:
+        clean_start_score = 0.0
+    elif first_w in filler_soft:
+        clean_start_score = 8.0
+    else:
+        clean_start_score = 25.0
+
+    # 4. Self-Contained Start (up to 25.0 points)
+    dangling_connectives = {
+        "and", "but", "or", "because", "so", "which", "plus", "also",
+        "then", "therefore", "that's", "he", "she", "they",
+    }
+    self_contained_starters = {
+        "i", "we", "you", "this", "these", "the", "a", "an", "if",
+        "when", "how", "why", "what", "there", "my", "our", "here", "today",
+    }
+    if first_w in dangling_connectives:
+        self_contained_score = 5.0
+    elif first_w in self_contained_starters:
+        self_contained_score = 25.0
+    else:
+        self_contained_score = 18.0
+
+    total_score = round(
+        min(100.0, max(0.0, density_score + marker_score + clean_start_score + self_contained_score)),
+        1,
+    )
+    breakdown = {
+        "hook_strength": round(marker_score / 2.5, 1),
+        "self_contained": round(self_contained_score / 2.5, 1),
+        "payoff": round(clean_start_score / 2.5, 1),
+        "emotional_intensity": round(density_score / 2.5, 1),
+    }
+    reason = (
+        f"Selected by transcript heuristics (score: {int(total_score)}/100, "
+        f"speech density: {wpm:.0f} WPM, clean start)"
+    )
+    return total_score, breakdown, reason
+
+
+def select_heuristic_clips(
+    words: list[dict],
+    max_clips: int = 3,
+    min_score: int | None = None,
+) -> list[dict]:
+    """Select non-overlapping sentence-aligned clips using transcript heuristics when LLM is unavailable."""
+    if not words:
+        return []
+
+    min_score = min_score if min_score is not None else settings.HEURISTIC_QUALITY_FLOOR
+    segments = build_transcript_segments(words)
+    if not segments:
+        return []
+
+    min_dur = settings.MIN_CLIP_DURATION_SECONDS
+    max_dur = settings.MAX_CLIP_DURATION_SECONDS
+
+    candidates: list[dict] = []
+    num_segs = len(segments)
+
+    for i in range(num_segs):
+        for j in range(i, num_segs):
+            dur = segments[j].end_time - segments[i].start_time
+            if dur > max_dur:
+                break
+            if dur < min_dur:
+                continue
+
+            window_segs = segments[i : j + 1]
+            total_score, breakdown, reason = score_heuristic_window(window_segs, dur)
+            if total_score >= min_score:
+                first_text = window_segs[0].text.strip()
+                title_words = first_text.split()[:6]
+                title = " ".join(title_words).strip(".,!?:;\"'()[]{}") or f"Highlight at {int(segments[i].start_time)}s"
+                hook = first_text[:80]
+
+                candidates.append(
+                    {
+                        "start_time": round(segments[i].start_time, 2),
+                        "end_time": round(segments[j].end_time, 2),
+                        "title": title,
+                        "hook": hook,
+                        "virality_score": int(round(total_score)),
+                        "score_breakdown": breakdown,
+                        "selection_method": "heuristic",
+                        "selection_reason": reason,
+                        "description": f"{title}. Key moment from the video.",
+                        "hashtags": ["shorts", "viral", "highlights"],
+                        "is_fallback": True,
+                    }
+                )
+
+    if not candidates:
+        return []
+
+    # Deduplicate non-overlapping windows preferring highest score
+    candidates.sort(key=lambda c: (c["virality_score"], c["end_time"] - c["start_time"]), reverse=True)
+
+    selected: list[dict] = []
+    for cand in candidates:
+        c_start = cand["start_time"]
+        c_end = cand["end_time"]
+        overlaps = False
+        for s in selected:
+            overlap_dur = max(0.0, min(c_end, s["end_time"]) - max(c_start, s["start_time"]))
+            if overlap_dur > 0.5:
+                overlaps = True
+                break
         if not overlaps:
-            clip_idx = len(clips) + 1
-            clips.append(
-                {
-                    "start_time": snapped_start,
-                    "end_time": snapped_end,
-                    "title": f"Highlight {clip_idx}",
-                    "virality_score": max(65, 85 - (clip_idx - 1) * 5),
-                    "description": "Watch this engaging moment extracted from the stream.",
-                    "hashtags": ["shorts", "viral", "clips"],
-                    "is_fallback": True,
-                }
-            )
+            selected.append(cand)
+            if len(selected) >= max_clips:
+                break
 
-    clips.sort(key=lambda x: x["start_time"])
-    return clips[:max_clips]
+    selected.sort(key=lambda c: c["start_time"])
+    return selected
 
 
 def find_viral_clips(
@@ -1049,26 +1149,16 @@ def find_viral_clips(
     max_clips: int = 3,
     llm_client: Any | None = None,
     superset_size: int | None = None,
+    allow_heuristic_fallback: bool = True,
 ) -> list[dict]:
     """Analyze transcript with LLM using structured segment selection, rubric scoring, and exact boundaries."""
     if not words:
-        return [
-            {
-                "start_time": 0.0,
-                "end_time": 0.0,
-                "title": "Default Clip",
-                "virality_score": 50,
-                "score_breakdown": {
-                    "hook_strength": 5.0,
-                    "self_contained": 5.0,
-                    "payoff": 5.0,
-                    "emotional_intensity": 5.0,
-                },
-                "description": "Watch this engaging moment extracted from the stream.",
-                "hashtags": ["shorts", "viral", "clips"],
-                "is_fallback": True,
-            }
-        ]
+        raise PipelineError(
+            code=PipelineErrorCode.NO_QUALIFYING_CLIPS,
+            stage="analyzing",
+            user_message="No speech or words found in transcript to analyze.",
+            retryable=False,
+        )
 
     min_start = min(float(w["start"]) for w in words)
     total_duration = max(float(w["end"]) for w in words)
@@ -1080,56 +1170,80 @@ def find_viral_clips(
         and total_duration > settings.WINDOWING_THRESHOLD_SECONDS
     )
 
-    if should_use_windowing:
-        # Long video with windowing enabled: Map-Reduce windowing with overlap >= max clip length + margin
-        window_size = settings.WINDOW_SIZE_SECONDS
-        overlap = max(
-            settings.WINDOW_OVERLAP_SECONDS,
-            settings.MAX_CLIP_DURATION_SECONDS + settings.WINDOW_OVERLAP_MARGIN_SECONDS,
-        )
-        step = max(1.0, window_size - overlap)
+    selected_candidates: list[dict] = []
 
-        pooled_candidates: list[dict] = []
-        win_start = 0.0
+    try:
+        if should_use_windowing:
+            # Long video with windowing enabled: Map-Reduce windowing with overlap >= max clip length + margin
+            window_size = settings.WINDOW_SIZE_SECONDS
+            overlap = max(
+                settings.WINDOW_OVERLAP_SECONDS,
+                settings.MAX_CLIP_DURATION_SECONDS + settings.WINDOW_OVERLAP_MARGIN_SECONDS,
+            )
+            step = max(1.0, window_size - overlap)
 
-        while win_start < total_duration:
-            win_end = min(total_duration, win_start + window_size)
-            window_words = [
-                w
-                for w in words
-                if float(w.get("end", 0.0)) > win_start
-                and float(w.get("start", 0.0)) < win_end
-            ]
+            pooled_candidates: list[dict] = []
+            win_start = 0.0
 
-            if len(window_words) >= 5:
-                window_clips = _analyze_transcript_segment(
-                    window_words, max_clips=effective_max_clips, llm_client=llm_client
+            while win_start < total_duration:
+                win_end = min(total_duration, win_start + window_size)
+                window_words = [
+                    w
+                    for w in words
+                    if float(w.get("end", 0.0)) > win_start
+                    and float(w.get("start", 0.0)) < win_end
+                ]
+
+                if len(window_words) >= 5:
+                    window_clips = _analyze_transcript_segment(
+                        window_words, max_clips=effective_max_clips, llm_client=llm_client
+                    )
+                    # Handle boundary-straddling clips: record only in the window that contains them fully
+                    for c in window_clips:
+                        if c["start_time"] >= win_start - 0.05 and c["end_time"] <= win_end + 0.05:
+                            pooled_candidates.append(c)
+                        else:
+                            logger.debug(
+                                "Dropping clip [%.2f-%.2f] not fully contained in window [%.2f-%.2f]",
+                                c["start_time"], c["end_time"], win_start, win_end,
+                            )
+
+                win_start += step
+                if win_end >= total_duration:
+                    break
+
+            selected_candidates = _rank_and_dedupe_clips(
+                pooled_candidates, max_clips=effective_max_clips, llm_client=llm_client
+            )
+        else:
+            # Single-pass path: Full transcript analysis within LLM context window
+            raw_candidates = _analyze_transcript_segment(
+                words, max_clips=effective_max_clips, llm_client=llm_client
+            )
+            selected_candidates = _dedupe_and_rank_candidates(
+                raw_candidates, max_clips=effective_max_clips
+            )
+
+    except PipelineError as pe:
+        if pe.code in (PipelineErrorCode.LLM_CONFIG, PipelineErrorCode.LLM_BLOCKED):
+            # Configuration and safety blocks must NOT trigger the heuristic path
+            raise pe
+        if pe.code == PipelineErrorCode.LLM_UNAVAILABLE and allow_heuristic_fallback:
+            logger.warning(
+                "LLM path exhausted retries (%s). Falling back to transcript heuristics.",
+                pe.user_message,
+            )
+            heuristic_clips = select_heuristic_clips(words, max_clips=effective_max_clips)
+            if not heuristic_clips:
+                raise PipelineError(
+                    code=PipelineErrorCode.NO_QUALIFYING_CLIPS,
+                    stage="analyzing",
+                    user_message="No qualifying clips met the heuristic quality floor after LLM failure.",
+                    retryable=False,
                 )
-                # Handle boundary-straddling clips: record only in the window that contains them fully
-                for c in window_clips:
-                    if c["start_time"] >= win_start - 0.05 and c["end_time"] <= win_end + 0.05:
-                        pooled_candidates.append(c)
-                    else:
-                        logger.debug(
-                            "Dropping clip [%.2f-%.2f] not fully contained in window [%.2f-%.2f]",
-                            c["start_time"], c["end_time"], win_start, win_end,
-                        )
-
-            win_start += step
-            if win_end >= total_duration:
-                break
-
-        selected_candidates = _rank_and_dedupe_clips(
-            pooled_candidates, max_clips=effective_max_clips, llm_client=llm_client
-        )
-    else:
-        # Single-pass path: Full transcript analysis within LLM context window
-        raw_candidates = _analyze_transcript_segment(
-            words, max_clips=effective_max_clips, llm_client=llm_client
-        )
-        selected_candidates = _dedupe_and_rank_candidates(
-            raw_candidates, max_clips=effective_max_clips
-        )
+            selected_candidates = heuristic_clips
+        else:
+            raise pe
 
     if not selected_candidates:
         raise PipelineError(
@@ -1231,12 +1345,20 @@ def find_viral_clips(
                 "hook": clip.get("hook", ""),
                 "virality_score": clip["virality_score"],
                 "score_breakdown": clip.get("score_breakdown", {}),
+                "selection_method": clip.get("selection_method", "llm"),
+                "selection_reason": clip.get(
+                    "selection_reason",
+                    "Selected by LLM based on narrative viral potential",
+                ),
                 "description": clip.get(
                     "description",
                     f"{clip['title']}. Watch this highlight from the stream.",
                 ),
                 "hashtags": clip.get("hashtags", ["shorts", "viral", "clips"]),
-                "is_fallback": False,
+                "is_fallback": bool(
+                    clip.get("is_fallback", False)
+                    or clip.get("selection_method") == "heuristic"
+                ),
                 "warnings": clip_warnings,
             }
         )
@@ -1247,6 +1369,13 @@ def find_viral_clips(
             stage="analyzing",
             user_message="Selected clips could not be snapped to valid boundaries.",
             retryable=False,
+        )
+
+    if len(valid_clips) < max_clips:
+        logger.warning(
+            "Fewer qualifying clips (%d) than requested (%d) found.",
+            len(valid_clips),
+            max_clips,
         )
 
     return valid_clips[:max_clips]

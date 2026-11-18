@@ -9,6 +9,8 @@ from app.services.analyzer import (
     compute_time_overlap,
     find_viral_clips,
     sanitize_clip_text,
+    score_heuristic_window,
+    select_heuristic_clips,
     validate_llm_config,
     _dedupe_and_rank_candidates,
 )
@@ -44,6 +46,8 @@ __all__ = [
     "is_silence_hallucination_text",
     "compute_transcript_validation",
     "find_viral_clips",
+    "select_heuristic_clips",
+    "score_heuristic_window",
     "crop_to_vertical",
     "compute_crop_filter",
     "generate_ass_subtitles",

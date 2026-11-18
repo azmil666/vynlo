@@ -233,6 +233,10 @@ def download_all_clips(job_id: str):
             captions_txt_lines.append(
                 f"Duration: {clip.duration}s | Score: {clip.virality_score}/100"
             )
+            captions_txt_lines.append(
+                f"Selection Method: {clip.selection_method}"
+                + (f" ({clip.selection_reason})" if clip.selection_reason else "")
+            )
             captions_txt_lines.append(f"Video URL: {clip.video_url}")
             captions_txt_lines.append("")
 

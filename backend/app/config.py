@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     DEDUPE_IOU_THRESHOLD: float = 0.3
     DEDUPE_MIN_OVERLAP_RATIO: float = 0.5
     DEDUPE_TEXT_SIMILARITY_THRESHOLD: float = 0.7
+    HEURISTIC_QUALITY_FLOOR: int = 65
 
     # Boundary Snapping & Lead-in/Tail Refinement
     SNAP_LEAD_IN_SECONDS: float = 0.20

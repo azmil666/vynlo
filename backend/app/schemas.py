@@ -141,14 +141,27 @@ class ClipResult(BaseModel):
     virality_score: int
     duration: float
     video_url: str
+    selection_method: Literal["llm", "heuristic"] = "llm"
+    selection_reason: Optional[str] = None
     is_fallback: bool = False
     description: str = ""
     hashtags: list[str] = Field(default_factory=list)
-    selection_method: Literal["llm", "heuristic"] = "llm"
     layout_used: Literal["speaker", "split"] = "speaker"
     detector: str = "yunet"
     caption_font: str = "Liberation Sans"
     render_ok: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_selection_method_and_is_fallback(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "selection_method" in data and "is_fallback" not in data:
+                data["is_fallback"] = (data["selection_method"] == "heuristic")
+            elif "is_fallback" in data and "selection_method" not in data:
+                data["selection_method"] = "heuristic" if data["is_fallback"] else "llm"
+            elif "selection_method" in data:
+                data["is_fallback"] = (data["selection_method"] == "heuristic")
+        return data
 
 
 PipelineStage = Literal[

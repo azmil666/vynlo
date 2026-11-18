@@ -29,12 +29,12 @@ def _simulate_candidate_cache_flow(
         cached_candidates
         and isinstance(cached_candidates, list)
         and len(cached_candidates) >= max_clips
-        and not any(c.get("is_fallback") for c in cached_candidates)
+        and not any(c.get("is_fallback") or c.get("selection_method") == "heuristic" for c in cached_candidates)
     ):
         return cached_candidates[:max_clips], True
     else:
         candidates = find_viral_clips(words, max_clips=max_clips, llm_client=fake_llm)
-        has_fallback = any(c.get("is_fallback") for c in candidates)
+        has_fallback = any(c.get("is_fallback") or c.get("selection_method") == "heuristic" for c in candidates)
         if not has_fallback:
             redis_client.set(candidates_cache_key, json.dumps(candidates), ex=604800)
         return candidates, False
@@ -171,16 +171,20 @@ class TestCandidateCacheGuards:
         assert len(candidates) == 1
 
     def test_skips_writing_cache_when_result_has_fallback(
-        self, fake_redis, transcript_empty, fake_llm
+        self, fake_redis, transcript_normal, fake_llm
     ):
-        video_id = "vid_empty_fallback"
-        # Empty words causes find_viral_clips to return fallback clips
+        video_id = "vid_heuristic_fallback"
+        # LLM failure triggers heuristic fallback clips
+        fake_llm.add_response(Exception("429 Resource has been exhausted"))
+        fake_llm.add_response(Exception("429 Resource has been exhausted"))
+        fake_llm.add_response(Exception("429 Resource has been exhausted"))
         candidates, cache_hit = _simulate_candidate_cache_flow(
-            fake_redis, video_id, max_clips=1, words=transcript_empty, fake_llm=fake_llm
+            fake_redis, video_id, max_clips=1, words=transcript_normal, fake_llm=fake_llm
         )
 
         assert cache_hit is False
-        assert any(c.get("is_fallback") for c in candidates)
+        assert len(candidates) >= 1
+        assert any(c.get("is_fallback") or c.get("selection_method") == "heuristic" for c in candidates)
         # Verify nothing was saved to Redis
         assert fake_redis.get(f"cache:candidates:{video_id}") is None
 
