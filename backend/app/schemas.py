@@ -4,6 +4,8 @@ import traceback
 from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
+from app.config import settings
+
 ALLOWED_VIDEO_DOMAINS = {
     "youtube.com",
     "www.youtube.com",
@@ -42,6 +44,7 @@ class JobErrorDetail(BaseModel):
     code: PipelineErrorCode
     message: str
     retryable: bool = False
+    stage: Optional[str] = None
     detail: Optional[str] = None
 
     def __str__(self) -> str:
@@ -76,6 +79,7 @@ class PipelineError(Exception):
             code=self.code,
             message=self.user_message,
             retryable=self.retryable,
+            stage=self.stage,
             detail=self.detail,
         )
 
@@ -203,12 +207,16 @@ def map_exception_to_pipeline_error(
         return PipelineError(
             code=PipelineErrorCode.VIDEO_TOO_LONG,
             stage=current_stage,
-            user_message="Video exceeds maximum supported duration of 4 hours.",
+            user_message=f"Video exceeds maximum supported duration of {settings.MAX_VIDEO_SECONDS}s.",
             retryable=False,
             detail=msg,
         )
 
-    if "unsupported video domain" in msg_lower or "invalid url" in msg_lower:
+    if (
+        "unsupported video domain" in msg_lower
+        or "invalid url" in msg_lower
+        or ("invalid" in msg_lower and "url" in msg_lower)
+    ):
         return PipelineError(
             code=PipelineErrorCode.INVALID_URL,
             stage=current_stage,
@@ -227,16 +235,18 @@ def map_exception_to_pipeline_error(
             detail=msg,
         )
 
-    # 4. Downloads
+    # 4. Downloads & network errors
     if (
-        "download" in msg_lower
+        isinstance(exc, (ConnectionError, TimeoutError))
+        or "download" in msg_lower
         or "failed to download" in msg_lower
+        or any(w in msg_lower for w in ["connection", "network error", "network disconnect", "http error 5", "failed to resolve", "nodename nor servname"])
         or (isinstance(exc, FileNotFoundError) and "source.mp4" in msg)
     ):
         return PipelineError(
             code=PipelineErrorCode.DOWNLOAD_FAILED,
             stage=current_stage,
-            user_message="Failed to download media from the provided URL.",
+            user_message="Failed to download media due to a network or connection error.",
             retryable=True,
             detail=msg,
         )

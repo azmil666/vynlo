@@ -5,8 +5,10 @@ import logging
 import os
 import shutil
 from typing import Any
+from uuid import uuid4
 
 from celery import Celery
+from celery.exceptions import Retry, SoftTimeLimitExceeded
 import cv2
 import redis
 
@@ -26,6 +28,7 @@ from app.services.analyzer import find_viral_clips
 from app.services.cropper import _get_face_detector, compute_crop_filter
 from app.services.captions import generate_ass_subtitles, render_clip_single_pass
 from app.services.storage import upload_clip
+from app.services.sweeper import cleanup_stale_temp_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,8 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    broker_transport_options={"visibility_timeout": settings.broker_visibility_timeout},
+    task_reject_on_worker_lost=False,
 )
 
 _redis_client = None
@@ -61,19 +66,62 @@ def set_redis_client(client: redis.Redis | None) -> None:
 redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
 
 
+@celery_app.task(name="sweep_stale_temp_dirs_task")
+def sweep_stale_temp_dirs_task() -> list[str]:
+    """Celery task to clean up old temp job directories."""
+    return cleanup_stale_temp_dirs()
+
+
 @celery_app.task(
     name="process_video_task",
     bind=True,
-    autoretry_for=(ConnectionError, TimeoutError),
-    retry_backoff=True,
     max_retries=2,
-    soft_time_limit=600,
-    time_limit=660,
+    soft_time_limit=settings.task_soft_time_limit,
+    time_limit=settings.task_time_limit,
     acks_late=True,
 )
 def process_video_task(self, job_id: str, options: dict) -> None:
     current_stage = "queued"
     warnings_list: list[dict] = []
+    r = get_redis_client()
+    job_key = f"job:{job_id}"
+    lock_key = f"lock:job:{job_id}"
+    worker_task_id = (
+        self.request.id
+        if getattr(self, "request", None) and getattr(self.request, "id", None)
+        else str(uuid4())
+    )
+
+    # 1. Idempotency guard: if job is already completed, do not duplicate work
+    existing_raw = r.get(job_key)
+    if existing_raw:
+        try:
+            existing_data = json.loads(existing_raw)
+            if (
+                existing_data.get("status") == "completed"
+                or existing_data.get("stage") == "completed"
+            ):
+                logger.info(
+                    "Job %s is already completed. Skipping redelivered task.",
+                    job_id,
+                )
+                return
+        except Exception:
+            pass
+
+    # 2. Redis distributed lock: prevent duplicate concurrent processing on redelivery
+    acquired_lock = bool(
+        r.set(lock_key, worker_task_id, nx=True, ex=settings.task_time_limit)
+    )
+    if not acquired_lock:
+        lock_owner = r.get(lock_key)
+        if lock_owner != worker_task_id:
+            logger.warning(
+                "Job %s is currently locked by another worker (%s). Skipping duplicate task.",
+                job_id,
+                lock_owner,
+            )
+            return
 
     def update_job_state(
         stage: str,
@@ -84,19 +132,19 @@ def process_video_task(self, job_id: str, options: dict) -> None:
     ) -> None:
         nonlocal current_stage
         current_stage = stage
-        r = get_redis_client()
-        job_key = f"job:{job_id}"
-        ttl = r.ttl(job_key)
+        r_conn = get_redis_client()
+        j_key = f"job:{job_id}"
+        ttl = r_conn.ttl(j_key)
         if ttl is None or ttl <= 0:
             ttl = 86400
 
         current_clips: list[dict] = []
         current_error: Any = None
         current_warnings: list[dict] = []
-        existing_raw = r.get(job_key)
-        if existing_raw:
+        existing_status_raw = r_conn.get(j_key)
+        if existing_status_raw:
             try:
-                existing_data = json.loads(existing_raw)
+                existing_data = json.loads(existing_status_raw)
                 current_clips = existing_data.get("clips", [])
                 current_error = existing_data.get("error")
                 current_warnings = existing_data.get("warnings", [])
@@ -117,7 +165,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             warnings=active_warnings,
             clips=clips if clips is not None else current_clips,
         )
-        r.set(job_key, state.model_dump_json(), ex=ttl)
+        r_conn.set(j_key, state.model_dump_json(), ex=ttl)
 
     work_dir = os.path.join(settings.TEMP_DIR, job_id)
     os.makedirs(work_dir, exist_ok=True)
@@ -272,6 +320,28 @@ def process_video_task(self, job_id: str, options: dict) -> None:
 
         update_job_state("completed", 100, clips=completed_clips)
 
+    except Retry:
+        raise
+    except SoftTimeLimitExceeded as e:
+        logger.error(
+            "Job %s exceeded soft time limit of %ds",
+            job_id,
+            settings.task_soft_time_limit,
+        )
+        timeout_err = JobErrorDetail(
+            code=PipelineErrorCode.TIMEOUT.value,
+            message=f"Job exceeded execution time limit ({settings.task_soft_time_limit}s).",
+            retryable=True,
+            stage=current_stage,
+            detail=str(e),
+        )
+        update_job_state(
+            stage="failed",
+            progress=0,
+            error=timeout_err,
+            warnings=warnings_list,
+        )
+        raise
     except Exception as e:
         pipeline_err = map_exception_to_pipeline_error(e, current_stage=current_stage)
         logger.exception(
@@ -281,6 +351,47 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             pipeline_err.code.value,
             pipeline_err.user_message,
         )
+
+        max_retries = getattr(self, "max_retries", 2)
+        current_retries = (
+            getattr(self.request, "retries", 0)
+            if getattr(self, "request", None)
+            else 0
+        )
+
+        # Retryable error policy with exponential backoff: only retry retryable errors
+        if pipeline_err.retryable and current_retries < max_retries:
+            countdown = int(5 * (2 ** current_retries))
+            logger.info(
+                "Retrying job %s (attempt %d/%d) in %ds due to retryable error: %s",
+                job_id,
+                current_retries + 1,
+                max_retries,
+                countdown,
+                pipeline_err.user_message,
+            )
+            retry_warning = {
+                "code": "TASK_RETRYING",
+                "message": (
+                    f"Transient error at stage '{current_stage}': {pipeline_err.user_message}. "
+                    f"Retrying in {countdown}s (attempt {current_retries + 1}/{max_retries})."
+                ),
+            }
+            update_job_state(
+                stage=current_stage,
+                progress=0,
+                warnings=warnings_list + [retry_warning],
+            )
+            # Release lock before retrying so subsequent attempt can re-acquire
+            if acquired_lock:
+                try:
+                    if r.get(lock_key) == worker_task_id:
+                        r.delete(lock_key)
+                        acquired_lock = False
+                except Exception:
+                    pass
+            raise self.retry(exc=e, countdown=countdown)
+
         update_job_state(
             stage="failed",
             progress=0,
@@ -289,4 +400,11 @@ def process_video_task(self, job_id: str, options: dict) -> None:
         )
         raise
     finally:
+        try:
+            if acquired_lock:
+                current_owner = r.get(lock_key)
+                if current_owner == worker_task_id:
+                    r.delete(lock_key)
+        except Exception as e:
+            logger.warning("Failed releasing lock for job %s: %s", job_id, e)
         shutil.rmtree(work_dir, ignore_errors=True)

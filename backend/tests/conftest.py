@@ -8,6 +8,7 @@ os.environ.setdefault("TEMP_DIR", "/tmp/clipper")
 
 import pytest
 import fakeredis
+from fastapi.testclient import TestClient
 
 from app.config import settings
 import app.main as app_main
@@ -44,6 +45,12 @@ def fake_redis():
     finally:
         app_main.set_redis_client(orig_main_client)
         app_worker.set_redis_client(orig_worker_client)
+
+
+@pytest.fixture
+def test_client(fake_redis):
+    """TestClient configured with fake_redis for isolated API route testing."""
+    return TestClient(app_main.app)
 
 
 @pytest.fixture

@@ -24,8 +24,10 @@ def get_video_metadata(url: str) -> dict:
         raise ValueError(f"Failed to extract metadata for URL: {url}")
 
     duration = float(info.get("duration") or 0)
-    if duration > 14400:
-        raise ValueError("Video exceeds maximum supported duration of 4 hours")
+    if duration > settings.MAX_VIDEO_SECONDS:
+        raise ValueError(
+            f"Video exceeds maximum supported duration of {settings.MAX_VIDEO_SECONDS}s"
+        )
 
     extractor_key = str(info.get("extractor_key") or "video").lower()
     raw_id = str(info.get("id") or "")

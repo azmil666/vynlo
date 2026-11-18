@@ -1,5 +1,7 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import io
+import logging
 import os
 import re
 import urllib.request
@@ -13,8 +15,16 @@ from fastapi.staticfiles import StaticFiles
 import redis
 
 from app.config import settings
-from app.schemas import JobCreateRequest, JobStatusResponse
+from app.schemas import (
+    JobCreateRequest,
+    JobErrorDetail,
+    JobStatusResponse,
+    PipelineErrorCode,
+)
+from app.services.sweeper import cleanup_stale_temp_dirs
 from app.worker import process_video_task
+
+logger = logging.getLogger(__name__)
 
 try:
     os.makedirs(settings.STATIC_DIR, exist_ok=True)
@@ -23,7 +33,20 @@ except OSError:
     os.makedirs(fallback_static, exist_ok=True)
     settings.STATIC_DIR = fallback_static
 
-app = FastAPI(title="Clipper MVP API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Sweep stale temp media directories on application startup
+    try:
+        cleaned = cleanup_stale_temp_dirs()
+        if cleaned:
+            logger.info("Cleaned %d stale temp directories on startup", len(cleaned))
+    except Exception as e:
+        logger.warning("Startup stale temp cleanup failed: %s", e)
+    yield
+
+
+app = FastAPI(title="Clipper MVP API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,12 +102,66 @@ def create_job(req: JobCreateRequest):
     return initial_status
 
 
+ACTIVE_PROCESSING_STAGES = {
+    "queued",
+    "downloading",
+    "transcribing",
+    "analyzing",
+    "rendering",
+}
+
+
 @app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)
 def get_job_status(job_id: str):
-    data = get_redis_client().get(f"job:{job_id}")
+    r = get_redis_client()
+    data = r.get(f"job:{job_id}")
     if not data:
         raise HTTPException(status_code=404, detail="Job not found")
-    return JobStatusResponse.model_validate_json(data)
+
+    job_status = JobStatusResponse.model_validate_json(data)
+
+    # Detect worker crash or killed worker process via stale heartbeat
+    is_active = (
+        job_status.status in ACTIVE_PROCESSING_STAGES
+        or job_status.stage in ACTIVE_PROCESSING_STAGES
+    )
+    if is_active and job_status.updated_at:
+        try:
+            raw_updated = job_status.updated_at
+            updated_dt = datetime.fromisoformat(raw_updated.replace("Z", "+00:00"))
+            if updated_dt.tzinfo is None:
+                updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+
+            age_seconds = (datetime.now(timezone.utc) - updated_dt).total_seconds()
+            if age_seconds > settings.WORKER_HEARTBEAT_TIMEOUT_SECONDS:
+                previous_stage = job_status.stage or job_status.status or "queued"
+                logger.warning(
+                    "Job %s stale heartbeat detected (%.1fs > %ds). Marking as WORKER_LOST.",
+                    job_id,
+                    age_seconds,
+                    settings.WORKER_HEARTBEAT_TIMEOUT_SECONDS,
+                )
+                job_status.status = "failed"
+                job_status.stage = "failed"
+                job_status.error = JobErrorDetail(
+                    code=PipelineErrorCode.WORKER_LOST.value,
+                    message=f"Worker lost or unresponsive for more than {settings.WORKER_HEARTBEAT_TIMEOUT_SECONDS}s.",
+                    retryable=True,
+                    stage=previous_stage,
+                    detail=f"Last updated at {raw_updated} ({int(age_seconds)}s ago)",
+                )
+                job_status.updated_at = datetime.now(timezone.utc).isoformat()
+
+                # Persist recovered state back to Redis
+                job_key = f"job:{job_id}"
+                ttl = r.ttl(job_key)
+                if ttl is None or ttl <= 0:
+                    ttl = 86400
+                r.set(job_key, job_status.model_dump_json(), ex=ttl)
+        except Exception as e:
+            logger.warning("Error evaluating worker heartbeat for job %s: %s", job_id, e)
+
+    return job_status
 
 
 @app.get("/api/jobs/{job_id}/download-all")
