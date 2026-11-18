@@ -2,6 +2,11 @@ services:
   redis:
     image: redis:7-alpine
     container_name: clipper_redis
+    # Guard Redis against unbounded memory growth from cached transcripts and candidates:
+    # - maxmemory 512mb bounds memory consumption in container environments.
+    # - volatile-lru evicts keys with a TTL (transcripts, candidates, and job records) in Least Recently Used order.
+    # - Persistent operational keys without TTL are protected from eviction.
+    command: redis-server --maxmemory 512mb --maxmemory-policy volatile-lru --save ""
     ports:
       - "6379:6379"
     restart: unless-stopped

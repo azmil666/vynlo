@@ -35,6 +35,19 @@ class Settings(BaseSettings):
     SNAP_PAUSE_THRESHOLD: float = 0.40
     SNAP_INITIAL_WINDOW_SECONDS: float = 1.5
     SNAP_WIDENED_WINDOW_SECONDS: float = 3.0
+
+    # Cache Configuration, Schema Versions & Guard Thresholds
+    GLOBAL_CACHE_VERSION: str = "v1"
+    TRANSCRIPT_SCHEMA_VERSION: str = "v1"
+    CANDIDATE_SCHEMA_VERSION: str = "v1"
+    PROMPT_VERSION: str = "v1"
+    CACHE_TRANSCRIPT_TTL_SECONDS: int = 604800  # 7 days
+    CACHE_CANDIDATES_TTL_SECONDS: int = 604800  # 7 days
+    CACHE_DURATION_TOLERANCE_SECONDS: float = 2.0  # Acceptable tolerance for duration mismatch
+    CACHE_COMPRESSION_ENABLED: bool = True
+    SINGLE_FLIGHT_LOCK_TTL_SECONDS: int = 300  # 5 minutes lock expiry
+    SINGLE_FLIGHT_WAIT_TIMEOUT_SECONDS: float = 120.0  # Max wait time for concurrent worker
+    SINGLE_FLIGHT_POLL_INTERVAL_SECONDS: float = 0.5  # Poll interval for waiting on single-flight lock
     TEMP_DIR: str = "/tmp/clipper"
     STATIC_DIR: str = "/app/static"
     PUBLIC_BASE_URL: str = "http://localhost:8000"

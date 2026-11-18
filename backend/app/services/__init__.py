@@ -14,6 +14,17 @@ from app.services.analyzer import (
     validate_llm_config,
     _dedupe_and_rank_candidates,
 )
+from app.services.cache import (
+    acquire_single_flight_lock,
+    get_cached_candidates,
+    get_cached_transcript,
+    get_candidates_cache_key,
+    get_transcript_cache_key,
+    release_single_flight_lock,
+    set_cached_candidates,
+    set_cached_transcript,
+    wait_for_single_flight_completion,
+)
 from app.services.captions import burn_subtitles, generate_ass_subtitles, render_clip_single_pass
 from app.services.cropper import crop_to_vertical, compute_crop_filter
 from app.services.downloader import (
@@ -45,6 +56,15 @@ __all__ = [
     "normalize_words",
     "is_silence_hallucination_text",
     "compute_transcript_validation",
+    "get_transcript_cache_key",
+    "get_candidates_cache_key",
+    "get_cached_transcript",
+    "set_cached_transcript",
+    "get_cached_candidates",
+    "set_cached_candidates",
+    "acquire_single_flight_lock",
+    "release_single_flight_lock",
+    "wait_for_single_flight_completion",
     "find_viral_clips",
     "select_heuristic_clips",
     "score_heuristic_window",

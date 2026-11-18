@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 from typing import Any
 from uuid import uuid4
 
@@ -29,6 +30,15 @@ from app.services.cropper import _get_face_detector, compute_crop_filter
 from app.services.captions import generate_ass_subtitles, render_clip_single_pass
 from app.services.storage import upload_clip
 from app.services.sweeper import cleanup_stale_temp_dirs
+from app.services.cache import (
+    acquire_single_flight_lock,
+    get_cached_candidates,
+    get_cached_transcript,
+    release_single_flight_lock,
+    set_cached_candidates,
+    set_cached_transcript,
+    wait_for_single_flight_completion,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,12 +214,10 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             video_id = f"url:{url_hash}"
 
         r = get_redis_client()
-        transcript_cache_key = f"cache:transcript:{video_id}"
-        candidates_cache_key = f"cache:candidates:{video_id}"
 
-        # 2. Check Redis for cached transcript
-        cached_words_raw = r.get(transcript_cache_key)
-        has_cached_transcript = cached_words_raw is not None
+        # 2. Check Redis for cached transcript before download (preliminary check to skip audio extraction)
+        cached_words, cached_val, _ = get_cached_transcript(r, video_id)
+        has_cached_transcript = cached_words is not None
 
         # 3. Download media: skip audio extraction if transcript is already cached
         update_job_state("downloading", 10)
@@ -221,84 +229,104 @@ def process_video_task(self, job_id: str, options: dict) -> None:
         )
         warnings_list.extend(dl_warnings)
 
-        # 4. Transcribe or load cached transcript
+        # 4. Transcribe or load cached transcript (with freshly probed duration validation)
         update_job_state("transcribing", 30)
-        if has_cached_transcript and cached_words_raw:
-            logger.info("Using cached transcript for %s", video_id)
-            cached_data = json.loads(cached_words_raw)
-            if isinstance(cached_data, dict) and "words" in cached_data:
-                words = cached_data["words"]
-            else:
-                words = cached_data
-        else:
-            if not audio_path:
-                audio_path = os.path.join(work_dir, "audio.wav")
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    video_path,
-                    "-vn",
-                    "-acodec",
-                    "pcm_s16le",
-                    "-ar",
-                    "16000",
-                    "-ac",
-                    "1",
-                    audio_path,
-                ]
-                subprocess.run(
-                    cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                )
-            words = transcribe_audio(
-                audio_path,
-                timeline_offset=source_info.timeline_offset if source_info else 0.0,
-                media_duration=source_info.duration if source_info else None,
+        probed_dur = source_info.duration if source_info else None
+        words, validation_dict, reject_reason = get_cached_transcript(
+            r, video_id, probed_duration=probed_dur
+        )
+
+        if reject_reason and reject_reason != "cache_miss":
+            warnings_list.append(
+                {
+                    "code": "TRANSCRIPT_CACHE_REJECTED",
+                    "message": f"Cached transcript rejected ({reject_reason}); re-transcribing.",
+                }
             )
-            validation_dict = (
-                words.validation.model_dump()
-                if hasattr(words, "validation") and hasattr(words.validation, "model_dump")
-                else {}
-            )
-            r.set(
-                transcript_cache_key,
-                json.dumps({"words": words, "validation": validation_dict}),
-                ex=604800,
-            )
+
+        if words is None:
+            # Single-flight lock for transcription to prevent duplicate computation
+            lock_acquired = acquire_single_flight_lock(r, f"transcription:{video_id}", worker_task_id)
+            if not lock_acquired:
+                logger.info("Concurrent transcription in progress for %s. Waiting for completion...", video_id)
+                def check_t():
+                    w, _, _ = get_cached_transcript(r, video_id, probed_duration=probed_dur)
+                    return w
+                waited_words = wait_for_single_flight_completion(r, f"transcription:{video_id}", check_t)
+                if waited_words is not None:
+                    words = waited_words
+                else:
+                    lock_acquired = acquire_single_flight_lock(r, f"transcription:{video_id}", worker_task_id)
+
+            if words is None:
+                try:
+                    if not audio_path:
+                        audio_path = os.path.join(work_dir, "audio.wav")
+                        cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            video_path,
+                            "-vn",
+                            "-acodec",
+                            "pcm_s16le",
+                            "-ar",
+                            "16000",
+                            "-ac",
+                            "1",
+                            audio_path,
+                        ]
+                        subprocess.run(
+                            cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                        )
+                    words = transcribe_audio(
+                        audio_path,
+                        timeline_offset=source_info.timeline_offset if source_info else 0.0,
+                        media_duration=source_info.duration if source_info else None,
+                    )
+                    validation_dict = (
+                        words.validation.model_dump()
+                        if hasattr(words, "validation") and hasattr(words.validation, "model_dump")
+                        else {}
+                    )
+                    set_cached_transcript(
+                        r,
+                        video_id,
+                        words,
+                        media_duration=probed_dur,
+                        validation_report=validation_dict,
+                    )
+                finally:
+                    if lock_acquired:
+                        release_single_flight_lock(r, f"transcription:{video_id}", worker_task_id)
 
         # 5. Viral analysis or load cached candidates
         update_job_state("analyzing", 50)
-        cached_candidates_raw = r.get(candidates_cache_key)
-        cached_candidates = None
-        if cached_candidates_raw:
-            try:
-                cached_candidates = json.loads(cached_candidates_raw)
-            except Exception:
-                cached_candidates = None
+        candidates, cache_hit = get_cached_candidates(r, video_id, words, max_clips=max_clips)
+        if not cache_hit:
+            # Single-flight lock for viral analysis
+            lock_acquired = acquire_single_flight_lock(r, f"analysis:{video_id}", worker_task_id)
+            if not lock_acquired:
+                logger.info("Concurrent analysis in progress for %s. Waiting for completion...", video_id)
+                def check_c():
+                    c_list, hit = get_cached_candidates(r, video_id, words, max_clips=max_clips)
+                    return c_list if hit else None
+                waited_candidates = wait_for_single_flight_completion(r, f"analysis:{video_id}", check_c)
+                if waited_candidates is not None:
+                    candidates = waited_candidates
+                    cache_hit = True
+                else:
+                    lock_acquired = acquire_single_flight_lock(r, f"analysis:{video_id}", worker_task_id)
 
-        if (
-            cached_candidates
-            and isinstance(cached_candidates, list)
-            and len(cached_candidates) >= max_clips
-            and not any(c.get("is_fallback") or c.get("selection_method") == "heuristic" for c in cached_candidates)
-        ):
-            logger.info("Using cached candidates for %s (found %d)", video_id, len(cached_candidates))
-            candidates = cached_candidates[:max_clips]
-        else:
-            superset_target = max(max_clips, settings.ANALYSIS_SUPERSET_SIZE)
-            all_candidates = find_viral_clips(words, max_clips=superset_target)
-            has_fallback = any(
-                c.get("is_fallback") or c.get("selection_method") == "heuristic"
-                for c in all_candidates
-            )
-            if not has_fallback:
-                r.set(candidates_cache_key, json.dumps(all_candidates), ex=604800)
-            else:
-                logger.info(
-                    "Skipping candidate caching for %s: candidates contain fallback clips",
-                    video_id,
-                )
-            candidates = all_candidates[:max_clips]
+            if not cache_hit:
+                try:
+                    superset_target = max(max_clips, settings.ANALYSIS_SUPERSET_SIZE)
+                    all_candidates = find_viral_clips(words, max_clips=superset_target)
+                    set_cached_candidates(r, video_id, words, all_candidates)
+                    candidates = all_candidates[:max_clips]
+                finally:
+                    if lock_acquired:
+                        release_single_flight_lock(r, f"analysis:{video_id}", worker_task_id)
 
         if len(candidates) < max_clips:
             warnings_list.append(

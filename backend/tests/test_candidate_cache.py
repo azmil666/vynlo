@@ -2,6 +2,11 @@ import json
 import pytest
 
 from app.services.analyzer import find_viral_clips
+from app.services.cache import (
+    get_cached_candidates,
+    get_candidates_cache_key,
+    set_cached_candidates,
+)
 from tests.fixtures.fake_llm import FakeLLM
 
 
@@ -16,28 +21,13 @@ def _simulate_candidate_cache_flow(
 
     Returns: (selected_candidates, cache_hit)
     """
-    candidates_cache_key = f"cache:candidates:{video_id}"
-    cached_candidates_raw = redis_client.get(candidates_cache_key)
-    cached_candidates = None
-    if cached_candidates_raw:
-        try:
-            cached_candidates = json.loads(cached_candidates_raw)
-        except Exception:
-            cached_candidates = None
+    candidates, hit = get_cached_candidates(redis_client, video_id, words, max_clips=max_clips)
+    if hit and candidates is not None:
+        return candidates, True
 
-    if (
-        cached_candidates
-        and isinstance(cached_candidates, list)
-        and len(cached_candidates) >= max_clips
-        and not any(c.get("is_fallback") or c.get("selection_method") == "heuristic" for c in cached_candidates)
-    ):
-        return cached_candidates[:max_clips], True
-    else:
-        candidates = find_viral_clips(words, max_clips=max_clips, llm_client=fake_llm)
-        has_fallback = any(c.get("is_fallback") or c.get("selection_method") == "heuristic" for c in candidates)
-        if not has_fallback:
-            redis_client.set(candidates_cache_key, json.dumps(candidates), ex=604800)
-        return candidates, False
+    all_candidates = find_viral_clips(words, max_clips=max_clips, llm_client=fake_llm)
+    set_cached_candidates(redis_client, video_id, words, all_candidates)
+    return all_candidates[:max_clips], False
 
 
 class TestCandidateCacheGuards:
@@ -72,21 +62,20 @@ class TestCandidateCacheGuards:
 
         assert cache_hit is False
         assert len(candidates) == 2
-        cached_raw = fake_redis.get(f"cache:candidates:{video_id}")
+        key = get_candidates_cache_key(video_id, transcript_normal)
+        cached_raw = fake_redis.get(key)
         assert cached_raw is not None
-        cached_data = json.loads(cached_raw)
-        assert len(cached_data) == 2
-        ttl = fake_redis.ttl(f"cache:candidates:{video_id}")
+        ttl = fake_redis.ttl(key)
         assert 0 < ttl <= 604800
 
     def test_cache_hit_returns_sliced_candidates(self, fake_redis, transcript_normal, fake_llm):
         video_id = "vid_hit"
         cached_clips = [
-            {"start_time": 1.0, "end_time": 5.0, "title": "Clip 1", "virality_score": 95, "is_fallback": False},
-            {"start_time": 6.0, "end_time": 10.0, "title": "Clip 2", "virality_score": 90, "is_fallback": False},
-            {"start_time": 11.0, "end_time": 15.0, "title": "Clip 3", "virality_score": 85, "is_fallback": False},
+            {"start_time": 1.0, "end_time": 5.0, "title": "Clip 1", "selection_method": "llm", "is_fallback": False, "virality_score": 95},
+            {"start_time": 6.0, "end_time": 10.0, "title": "Clip 2", "selection_method": "llm", "is_fallback": False, "virality_score": 90},
+            {"start_time": 11.0, "end_time": 15.0, "title": "Clip 3", "selection_method": "llm", "is_fallback": False, "virality_score": 85},
         ]
-        fake_redis.set(f"cache:candidates:{video_id}", json.dumps(cached_clips))
+        set_cached_candidates(fake_redis, video_id, transcript_normal, cached_clips)
 
         # Request 2 clips when cache has 3
         candidates, cache_hit = _simulate_candidate_cache_flow(
@@ -100,40 +89,34 @@ class TestCandidateCacheGuards:
         # Verify LLM was not called
         assert len(fake_llm.calls) == 0
 
-    def test_cache_bypass_when_insufficient_clips(self, fake_redis, transcript_normal, fake_llm):
+    def test_cache_reuse_when_requesting_more_clips_than_cached(self, fake_redis, transcript_normal, fake_llm):
+        """P4: Deleted len(cached)<max_clips bypass. Reuses cached superset even if fewer than requested."""
         video_id = "vid_insufficient"
         cached_clips = [
-            {"start_time": 1.0, "end_time": 5.0, "title": "Clip 1", "virality_score": 95, "is_fallback": False}
+            {"start_time": 1.0, "end_time": 5.0, "title": "Clip 1", "selection_method": "llm", "is_fallback": False, "virality_score": 95}
         ]
-        fake_redis.set(f"cache:candidates:{video_id}", json.dumps(cached_clips))
+        set_cached_candidates(fake_redis, video_id, transcript_normal, cached_clips)
 
         # Request 2 clips when cache only has 1
-        fake_llm.add_response(
-            {
-                "clips": [
-                    {"start_time": 1.0, "end_time": 6.5, "title": "New 1", "virality_score": 90},
-                    {"start_time": 12.0, "end_time": 18.0, "title": "New 2", "virality_score": 85},
-                ]
-            }
-        )
-
         candidates, cache_hit = _simulate_candidate_cache_flow(
             fake_redis, video_id, max_clips=2, words=transcript_normal, fake_llm=fake_llm
         )
 
-        assert cache_hit is False
-        assert len(candidates) == 2
-        assert len(fake_llm.calls) == 1
+        # Reuses the cached clip without calling LLM
+        assert cache_hit is True
+        assert len(candidates) == 1
+        assert len(fake_llm.calls) == 0
 
     def test_cache_bypass_when_cached_contains_fallback(
         self, fake_redis, transcript_normal, fake_llm
     ):
         video_id = "vid_fallback"
         cached_clips = [
-            {"start_time": 1.0, "end_time": 5.0, "title": "Fallback 1", "is_fallback": True},
-            {"start_time": 6.0, "end_time": 10.0, "title": "Fallback 2", "is_fallback": False},
+            {"start_time": 1.0, "end_time": 5.0, "title": "Fallback 1", "selection_method": "heuristic", "is_fallback": True},
+            {"start_time": 6.0, "end_time": 10.0, "title": "Fallback 2", "selection_method": "llm", "is_fallback": False},
         ]
-        fake_redis.set(f"cache:candidates:{video_id}", json.dumps(cached_clips))
+        key = get_candidates_cache_key(video_id, transcript_normal)
+        fake_redis.set(key, json.dumps({"candidates": cached_clips}))
 
         fake_llm.add_response(
             {
@@ -153,7 +136,8 @@ class TestCandidateCacheGuards:
 
     def test_cache_bypass_on_corrupt_json(self, fake_redis, transcript_normal, fake_llm):
         video_id = "vid_corrupt"
-        fake_redis.set(f"cache:candidates:{video_id}", "corrupted_non_json_string{")
+        key = get_candidates_cache_key(video_id, transcript_normal)
+        fake_redis.set(key, "corrupted_non_json_string{")
 
         fake_llm.add_response(
             {
@@ -186,18 +170,26 @@ class TestCandidateCacheGuards:
         assert len(candidates) >= 1
         assert any(c.get("is_fallback") or c.get("selection_method") == "heuristic" for c in candidates)
         # Verify nothing was saved to Redis
-        assert fake_redis.get(f"cache:candidates:{video_id}") is None
+        key = get_candidates_cache_key(video_id, transcript_normal)
+        assert fake_redis.get(key) is None
 
-    @pytest.mark.xfail(
-        reason="Bug: non-dict items in cached list crash any(c.get('is_fallback')) with AttributeError",
-        strict=True,
-    )
-    def test_corrupt_cached_elements_crash_bug(self, fake_redis, transcript_normal, fake_llm):
+    def test_corrupt_cached_elements_no_crash(self, fake_redis, transcript_normal, fake_llm):
         video_id = "vid_str_list"
+        key = get_candidates_cache_key(video_id, transcript_normal)
         # Redis holds a JSON list of strings instead of dicts
-        fake_redis.set(f"cache:candidates:{video_id}", json.dumps(["clip1", "clip2"]))
+        fake_redis.set(key, json.dumps(["clip1", "clip2"]))
 
-        # Current worker implementation raises AttributeError without try/except
-        _simulate_candidate_cache_flow(
-            fake_redis, video_id, max_clips=2, words=transcript_normal, fake_llm=fake_llm
+        fake_llm.add_response(
+            {
+                "clips": [
+                    {"start_time": 1.0, "end_time": 6.0, "title": "Safe", "virality_score": 90}
+                ]
+            }
         )
+
+        # Does not crash with AttributeError
+        candidates, cache_hit = _simulate_candidate_cache_flow(
+            fake_redis, video_id, max_clips=1, words=transcript_normal, fake_llm=fake_llm
+        )
+        assert cache_hit is False
+        assert len(candidates) == 1
