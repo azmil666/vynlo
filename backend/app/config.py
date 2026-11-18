@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     DEDUPE_IOU_THRESHOLD: float = 0.3
     DEDUPE_MIN_OVERLAP_RATIO: float = 0.5
     DEDUPE_TEXT_SIMILARITY_THRESHOLD: float = 0.7
+
+    # Boundary Snapping & Lead-in/Tail Refinement
+    SNAP_LEAD_IN_SECONDS: float = 0.20
+    SNAP_TAIL_SECONDS: float = 0.35
+    SNAP_PAUSE_THRESHOLD: float = 0.40
+    SNAP_INITIAL_WINDOW_SECONDS: float = 1.5
+    SNAP_WIDENED_WINDOW_SECONDS: float = 3.0
     TEMP_DIR: str = "/tmp/clipper"
     STATIC_DIR: str = "/app/static"
     PUBLIC_BASE_URL: str = "http://localhost:8000"

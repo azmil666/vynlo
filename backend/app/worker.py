@@ -297,6 +297,10 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 )
             candidates = all_candidates[:max_clips]
 
+        for clip in candidates:
+            for w in clip.get("warnings", []):
+                warnings_list.append(JobWarning(code="BOUNDARY_SNAP", message=str(w)))
+
         completed_clips: list[dict] = []
         total_candidates = len(candidates)
 
@@ -376,7 +380,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 }
             )
 
-        update_job_state("completed", 100, clips=completed_clips)
+        update_job_state("completed", 100, clips=completed_clips, warnings=warnings_list)
 
     except Retry:
         raise

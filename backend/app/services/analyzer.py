@@ -219,76 +219,184 @@ def format_segments_for_llm(segments: list[TranscriptSegment]) -> str:
     return "\n".join(lines)
 
 
+def _is_sentence_start(words: list[dict], i: int, pause_threshold: float) -> bool:
+    """Check if word at index i is a valid sentence/clause start."""
+    if i == 0:
+        return True
+    prev_word = words[i - 1]
+    prev_text = str(prev_word.get("word", "")).strip()
+    gap = float(words[i].get("start", 0.0)) - float(prev_word.get("end", 0.0))
+    if prev_text.endswith((".", "!", "?", "—", "...", "\n")) or gap >= pause_threshold:
+        return True
+    return False
+
+
+def _is_sentence_end(words: list[dict], i: int, pause_threshold: float) -> bool:
+    """Check if word at index i is a valid sentence/clause end."""
+    if i == len(words) - 1:
+        return True
+    next_word = words[i + 1]
+    word_text = str(words[i].get("word", "")).strip()
+    gap = float(next_word.get("start", 0.0)) - float(words[i].get("end", 0.0))
+    if word_text.endswith((".", "!", "?", "—", "...", "\n")) or gap >= pause_threshold:
+        return True
+    return False
+
+
+def _find_word_index_for_time(words: list[dict], target_time: float, prefer_start: bool = True) -> int:
+    """Find word index containing or closest to target_time."""
+    for i, w in enumerate(words):
+        if float(w.get("start", 0.0)) <= target_time <= float(w.get("end", 0.0)):
+            return i
+    if prefer_start:
+        return min(range(len(words)), key=lambda i: abs(float(words[i].get("start", 0.0)) - target_time))
+    else:
+        return min(range(len(words)), key=lambda i: abs(float(words[i].get("end", 0.0)) - target_time))
+
+
+def _snap_start_boundary(
+    start_time: float,
+    words: list[dict],
+    lead_in_target: float,
+    pause_threshold: float,
+    initial_window: float,
+    widened_window: float,
+    warnings: list[str] | None = None,
+) -> float:
+    # 1. Search candidates in initial window [start_time - initial_window, start_time + initial_window]
+    candidate_indices = [
+        i for i, w in enumerate(words)
+        if (start_time - initial_window) <= float(w.get("start", 0.0)) <= (start_time + initial_window)
+    ]
+    sentence_start_indices = [i for i in candidate_indices if _is_sentence_start(words, i, pause_threshold)]
+
+    chosen_index: int | None = None
+    if sentence_start_indices:
+        chosen_index = min(sentence_start_indices, key=lambda i: abs(float(words[i].get("start", 0.0)) - start_time))
+    else:
+        # Widen search window once
+        widened_indices = [
+            i for i, w in enumerate(words)
+            if (start_time - widened_window) <= float(w.get("start", 0.0)) <= (start_time + widened_window)
+        ]
+        sentence_start_indices = [i for i in widened_indices if _is_sentence_start(words, i, pause_threshold)]
+        if sentence_start_indices:
+            chosen_index = min(sentence_start_indices, key=lambda i: abs(float(words[i].get("start", 0.0)) - start_time))
+        else:
+            # If still no valid sentence boundary found, keep the segment / word boundary
+            chosen_index = _find_word_index_for_time(words, start_time, prefer_start=True)
+            msg = f"No natural start sentence boundary found near {start_time:.2f}s after widening; keeping word boundary."
+            logger.warning(msg)
+            if warnings is not None:
+                warnings.append(msg)
+
+    chosen_word = words[chosen_index]
+    w_start = float(chosen_word.get("start", 0.0))
+
+    # Lead-in capped so it never enters the previous word (use min(lead_in, gap/2))
+    if chosen_index == 0:
+        gap = max(0.0, w_start)
+        capped_lead_in = min(lead_in_target, gap)
+    else:
+        prev_end = float(words[chosen_index - 1].get("end", 0.0))
+        gap = max(0.0, w_start - prev_end)
+        capped_lead_in = min(lead_in_target, gap / 2.0)
+
+    snapped_start = max(0.0, w_start - capped_lead_in)
+    return snapped_start
+
+
+def _snap_end_boundary(
+    end_time: float,
+    words: list[dict],
+    max_video_time: float,
+    tail_target: float,
+    pause_threshold: float,
+    initial_window: float,
+    widened_window: float,
+    warnings: list[str] | None = None,
+) -> float:
+    # 1. Search candidates in initial window [end_time - initial_window, end_time + initial_window]
+    candidate_indices = [
+        i for i, w in enumerate(words)
+        if (end_time - initial_window) <= float(w.get("end", 0.0)) <= (end_time + initial_window)
+    ]
+    sentence_end_indices = [i for i in candidate_indices if _is_sentence_end(words, i, pause_threshold)]
+
+    chosen_index: int | None = None
+    if sentence_end_indices:
+        # Pick the valid end word closest to end_time
+        chosen_index = min(sentence_end_indices, key=lambda i: abs(float(words[i].get("end", 0.0)) - end_time))
+    else:
+        # Widen search window once
+        widened_indices = [
+            i for i, w in enumerate(words)
+            if (end_time - widened_window) <= float(w.get("end", 0.0)) <= (end_time + widened_window)
+        ]
+        sentence_end_indices = [i for i in widened_indices if _is_sentence_end(words, i, pause_threshold)]
+        if sentence_end_indices:
+            chosen_index = min(sentence_end_indices, key=lambda i: abs(float(words[i].get("end", 0.0)) - end_time))
+        else:
+            # If still no valid sentence boundary found, keep the segment / word boundary
+            chosen_index = _find_word_index_for_time(words, end_time, prefer_start=False)
+            msg = f"No natural end sentence boundary found near {end_time:.2f}s after widening; keeping word boundary."
+            logger.warning(msg)
+            if warnings is not None:
+                warnings.append(msg)
+
+    chosen_word = words[chosen_index]
+    w_end = float(chosen_word.get("end", 0.0))
+
+    # Tail capped so it never reaches the next word's start (use min(tail, gap/2))
+    if chosen_index == len(words) - 1:
+        gap = max(0.0, max_video_time - w_end)
+        capped_tail = min(tail_target, gap)
+    else:
+        next_start = float(words[chosen_index + 1].get("start", 0.0))
+        gap = max(0.0, next_start - w_end)
+        capped_tail = min(tail_target, gap / 2.0)
+
+    snapped_end = min(max_video_time, w_end + capped_tail)
+    return snapped_end
+
+
 def _snap_boundaries(
-    start_time: float, end_time: float, words: list[dict]
+    start_time: float,
+    end_time: float,
+    words: list[dict],
+    warnings: list[str] | None = None,
 ) -> tuple[float, float]:
-    """Snap start and end times to natural sentence or silence boundaries."""
+    """Snap start and end times to natural sentence boundaries with lead-in and tail refinement."""
     if not words:
-        return max(0.0, start_time), max(start_time + 1.0, end_time)
+        s = max(0.0, start_time)
+        e = max(s + 1.0, end_time) if end_time <= s else end_time
+        return round(s, 2), round(e, 2)
 
     max_video_time = max(float(w.get("end", 0.0)) for w in words)
+    min_video_time = min(float(w.get("start", 0.0)) for w in words)
 
-    # 1. Start Snap: Search words in [start_time - 2.0, start_time + 2.0]
-    snapped_start = start_time
-    start_window_words: list[tuple[int, dict]] = [
-        (i, w)
-        for i, w in enumerate(words)
-        if (start_time - 2.0) <= float(w.get("start", 0.0)) <= (start_time + 2.0)
-    ]
+    if start_time >= max_video_time:
+        snapped_start = max(min_video_time, max_video_time - min(15.0, max(1.0, max_video_time - min_video_time)))
+        snapped_end = max_video_time
+        return round(snapped_start, 2), round(snapped_end, 2)
 
-    sentence_starts: list[dict] = []
-    for i, w in start_window_words:
-        if i == 0:
-            sentence_starts.append(w)
-        else:
-            prev_word = words[i - 1]
-            prev_text = str(prev_word.get("word", "")).strip()
-            pause = float(w.get("start", 0.0)) - float(prev_word.get("end", 0.0))
-            if prev_text.endswith((".", "?", "!")) or pause > 0.65:
-                sentence_starts.append(w)
+    lead_in = getattr(settings, "SNAP_LEAD_IN_SECONDS", 0.20)
+    tail = getattr(settings, "SNAP_TAIL_SECONDS", 0.35)
+    pause_thresh = getattr(settings, "SNAP_PAUSE_THRESHOLD", 0.40)
+    init_win = getattr(settings, "SNAP_INITIAL_WINDOW_SECONDS", 1.5)
+    wide_win = getattr(settings, "SNAP_WIDENED_WINDOW_SECONDS", 3.0)
 
-    if sentence_starts:
-        best_start_word = min(
-            sentence_starts,
-            key=lambda w: abs(float(w.get("start", 0.0)) - start_time),
-        )
-        snapped_start = max(0.0, float(best_start_word.get("start", 0.0)) - 0.25)
-    elif start_window_words:
-        closest_word = min(
-            start_window_words,
-            key=lambda item: abs(float(item[1].get("start", 0.0)) - start_time),
-        )[1]
-        snapped_start = max(0.0, float(closest_word.get("start", 0.0)) - 0.25)
-
-    # 2. End Snap: Search words in [end_time - 2.5, end_time + 2.5]
-    snapped_end = end_time
-    end_window_words: list[tuple[int, dict]] = [
-        (i, w)
-        for i, w in enumerate(words)
-        if (end_time - 2.5) <= float(w.get("end", 0.0)) <= (end_time + 2.5)
-    ]
-
-    sentence_ends: list[dict] = []
-    for i, w in end_window_words:
-        word_text = str(w.get("word", "")).strip()
-        is_last_word = (i == len(words) - 1)
-        next_pause = 0.0
-        if not is_last_word:
-            next_word = words[i + 1]
-            next_pause = float(next_word.get("start", 0.0)) - float(w.get("end", 0.0))
-
-        if word_text.endswith((".", "?", "!")) or next_pause > 0.65 or is_last_word:
-            sentence_ends.append(w)
-
-    if sentence_ends:
-        best_end_word = sentence_ends[-1]
-        snapped_end = min(max_video_time, float(best_end_word.get("end", 0.0)) + 0.35)
-    elif end_window_words:
-        best_end_word = end_window_words[-1][1]
-        snapped_end = min(max_video_time, float(best_end_word.get("end", 0.0)) + 0.35)
+    snapped_start = _snap_start_boundary(
+        start_time, words, lead_in, pause_thresh, init_win, wide_win, warnings=warnings
+    )
+    snapped_end = _snap_end_boundary(
+        end_time, words, max_video_time, tail, pause_thresh, init_win, wide_win, warnings=warnings
+    )
 
     if snapped_end <= snapped_start:
         snapped_end = min(max_video_time, snapped_start + 15.0)
+        if snapped_end <= snapped_start:
+            snapped_start = max(0.0, snapped_end - 5.0)
 
     return round(snapped_start, 2), round(snapped_end, 2)
 
@@ -1031,19 +1139,94 @@ def find_viral_clips(
             retryable=False,
         )
 
-    # Apply sentence & silence boundary snapping to each selected clip
+    # Apply sentence & silence boundary snapping and post-snap re-validation to each selected clip
     valid_clips: list[dict] = []
+    min_dur = settings.MIN_CLIP_DURATION_SECONDS
+    max_dur = settings.MAX_CLIP_DURATION_SECONDS
+    media_duration = total_duration
+
     for clip in selected_candidates:
+        orig_start = clip["start_time"]
+        orig_end = clip["end_time"]
+        title = clip.get("title", "Clip")
+        clip_warnings: list[str] = list(clip.get("warnings", []))
+
         snapped_start, snapped_end = _snap_boundaries(
-            clip["start_time"], clip["end_time"], words
+            orig_start, orig_end, words, warnings=clip_warnings
         )
-        if (snapped_end - snapped_start) < 5.0:
+
+        # 1. Re-validate within media duration [0.0, media_duration]
+        if snapped_start < 0.0:
+            snapped_start = 0.0
+        if snapped_end > media_duration:
+            snapped_end = media_duration
+
+        # 2. Re-validate min/max duration
+        dur = snapped_end - snapped_start
+        if dur > max_dur:
+            msg = f"Clip '{title}' duration ({dur:.2f}s) exceeded max duration ({max_dur:.2f}s) after snapping. Adjusting."
+            logger.warning(msg)
+            clip_warnings.append(msg)
+            snapped_end = min(media_duration, snapped_start + max_dur)
+            dur = snapped_end - snapped_start
+
+        if dur < min_dur:
+            if (orig_end - orig_start) >= min_dur:
+                snapped_start = orig_start
+                snapped_end = orig_end
+                dur = snapped_end - snapped_start
+                msg = f"Clip '{title}' fell below min duration ({min_dur:.2f}s) after snapping; restored segment boundary."
+                logger.warning(msg)
+                clip_warnings.append(msg)
+            else:
+                msg = f"Clip '{title}' duration ({dur:.2f}s) below minimum duration ({min_dur:.2f}s); dropping clip."
+                logger.warning(msg)
+                continue
+
+        # 3. Re-validate no overlap with other already accepted clips
+        has_overlap = False
+        for accepted in valid_clips:
+            acc_s = accepted["start_time"]
+            acc_e = accepted["end_time"]
+            overlap_dur = max(0.0, min(snapped_end, acc_e) - max(snapped_start, acc_s))
+            if overlap_dur > 0:
+                if snapped_start < acc_e and snapped_start >= acc_s:
+                    adjusted_start = acc_e
+                    if (snapped_end - adjusted_start) >= min_dur:
+                        msg = f"Adjusted start of '{title}' from {snapped_start:.2f}s to {adjusted_start:.2f}s to resolve overlap with '{accepted['title']}'."
+                        logger.warning(msg)
+                        clip_warnings.append(msg)
+                        snapped_start = adjusted_start
+                    else:
+                        has_overlap = True
+                        break
+                elif snapped_end > acc_s and snapped_end <= acc_e:
+                    adjusted_end = acc_s
+                    if (adjusted_end - snapped_start) >= min_dur:
+                        msg = f"Adjusted end of '{title}' from {snapped_end:.2f}s to {adjusted_end:.2f}s to resolve overlap with '{accepted['title']}'."
+                        logger.warning(msg)
+                        clip_warnings.append(msg)
+                        snapped_end = adjusted_end
+                    else:
+                        has_overlap = True
+                        break
+                else:
+                    has_overlap = True
+                    break
+
+        if has_overlap:
+            msg = f"Clip '{title}' dropped due to unresolved overlap with previously selected clip after snapping."
+            logger.warning(msg)
+            continue
+
+        final_dur = round(snapped_end - snapped_start, 2)
+        if final_dur < min_dur or final_dur > max_dur:
             continue
 
         valid_clips.append(
             {
-                "start_time": snapped_start,
-                "end_time": snapped_end,
+                "start_time": round(snapped_start, 2),
+                "end_time": round(snapped_end, 2),
                 "title": clip["title"],
                 "hook": clip.get("hook", ""),
                 "virality_score": clip["virality_score"],
@@ -1054,6 +1237,7 @@ def find_viral_clips(
                 ),
                 "hashtags": clip.get("hashtags", ["shorts", "viral", "clips"]),
                 "is_fallback": False,
+                "warnings": clip_warnings,
             }
         )
 
