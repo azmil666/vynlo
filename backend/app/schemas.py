@@ -146,7 +146,9 @@ class ClipResult(BaseModel):
     is_fallback: bool = False
     description: str = ""
     hashtags: list[str] = Field(default_factory=list)
-    layout_used: Literal["speaker", "split"] = "speaker"
+    layout_used: Literal["speaker", "split", "fit_blur"] = "speaker"
+    detection_coverage: Optional[float] = None
+    coverage: Optional[float] = None
     detector: str = "yunet"
     caption_font: str = "Liberation Sans"
     render_ok: bool = True
@@ -161,6 +163,11 @@ class ClipResult(BaseModel):
                 data["selection_method"] = "heuristic" if data["is_fallback"] else "llm"
             elif "selection_method" in data:
                 data["is_fallback"] = (data["selection_method"] == "heuristic")
+            # Sync coverage and detection_coverage
+            if "detection_coverage" in data and "coverage" not in data:
+                data["coverage"] = data["detection_coverage"]
+            elif "coverage" in data and "detection_coverage" not in data:
+                data["detection_coverage"] = data["coverage"]
         return data
 
 

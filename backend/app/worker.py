@@ -386,6 +386,27 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 mode=layout_mode,
                 source_info=source_info,
             )
+            actual_layout = getattr(crop_filter, "layout_used", layout_mode)
+            clip_coverage = getattr(crop_filter, "coverage", None)
+
+            if actual_layout != layout_mode:
+                cov_str = (
+                    f" ({clip_coverage * 100:.1f}%)"
+                    if clip_coverage is not None
+                    else ""
+                )
+                warnings_list.append(
+                    JobWarning(
+                        code="LAYOUT_FALLBACK",
+                        message=(
+                            f"Clip {i}: Face detection coverage{cov_str} is below threshold "
+                            f"({settings.FACE_COVERAGE_THRESHOLD * 100:.0f}%). "
+                            f"Used '{actual_layout}' layout instead of requested '{layout_mode}'."
+                        ),
+                        clip_index=i,
+                    )
+                )
+
             generate_ass_subtitles(
                 words,
                 clip["start_time"],
@@ -434,7 +455,9 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                     "selection_reason": sel_reason,
                     "description": clip.get("description", ""),
                     "hashtags": clip.get("hashtags", []),
-                    "layout_used": layout_mode,
+                    "layout_used": actual_layout,
+                    "detection_coverage": round(clip_coverage, 3) if clip_coverage is not None else None,
+                    "coverage": round(clip_coverage, 3) if clip_coverage is not None else None,
                     "detector": detector_name,
                     "caption_font": "Liberation Sans",
                     "render_ok": True,

@@ -30,18 +30,30 @@ class TestComputeCropFilterOutputStrings:
             == "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1"
         )
 
-    def test_speaker_mode_landscape_16_9_default_center(self, video_16_9_30s: str):
-        # 16:9 test pattern without detected human faces falls back to center crop (0.5)
-        # crop_w = 606, frame_h = 1080, static_x = 656
+    def test_speaker_mode_landscape_16_9_no_faces_falls_back_to_fit_blur(self, video_16_9_30s: str):
+        # 16:9 test pattern without detected human faces falls back to fit_blur instead of dead-center crop
         filter_str = compute_crop_filter(video_16_9_30s, 0.0, 3.0, mode="speaker")
-        assert filter_str.startswith("crop=606:1080:")
-        assert "scale=1080:1920:flags=lanczos,setsar=1" in filter_str
+        assert filter_str.layout_used == "fit_blur"
+        assert filter_str.coverage == 0.0
+        assert "boxblur" in filter_str
+        assert "overlay" in filter_str
 
-    def test_speaker_mode_square_video_filter(self, video_square: str):
-        # Square video (1080x1080): crop_w = 606, frame_h = 1080, center x = 236
+        # When force_crop=True is passed, it forces the center crop (0.5)
+        forced_str = compute_crop_filter(video_16_9_30s, 0.0, 3.0, mode="speaker", force_crop=True)
+        assert forced_str.startswith("crop=606:1080:")
+        assert "scale=1080:1920:flags=lanczos,setsar=1" in forced_str
+
+    def test_speaker_mode_square_video_no_faces_falls_back_to_fit_blur(self, video_square: str):
+        # Square video without faces falls back to fit_blur
         filter_str = compute_crop_filter(video_square, 0.0, 2.0, mode="speaker")
-        assert filter_str.startswith("crop=606:1080:")
-        assert "scale=1080:1920:flags=lanczos,setsar=1" in filter_str
+        assert filter_str.layout_used == "fit_blur"
+        assert filter_str.coverage == 0.0
+        assert "boxblur" in filter_str
+
+        # With force_crop=True, forces crop filter
+        forced_str = compute_crop_filter(video_square, 0.0, 2.0, mode="speaker", force_crop=True)
+        assert forced_str.startswith("crop=606:1080:")
+        assert "scale=1080:1920:flags=lanczos,setsar=1" in forced_str
 
     @pytest.mark.slow
     def test_crop_to_vertical_full_pipeline(self, video_vertical: str, tmp_path: Path):

@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     FACE_DETECTION_NMS_THRESHOLD: float = 0.3
     FACE_DETECTION_TOP_K: int = 10
 
+    # Face Reframing, Coverage & Layout Fallback Configuration
+    FACE_COVERAGE_THRESHOLD: float = 0.40
+    FACE_MAX_GAP_FILL_SECONDS: float = 1.5
+    FACE_EASE_DURATION_SECONDS: float = 1.0
+    FACE_NEUTRAL_POSITION: float = 0.5
+
     # Cache Configuration, Schema Versions & Guard Thresholds
     GLOBAL_CACHE_VERSION: str = "v1"
     TRANSCRIPT_SCHEMA_VERSION: str = "v1"

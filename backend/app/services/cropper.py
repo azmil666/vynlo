@@ -363,21 +363,174 @@ def sample_faces_sequentially(
 # Crop Filter Computation & Single-Pass Vertical Reframing
 # ============================================================================
 
+FIT_BLUR_FILTER = (
+    "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:20,setsar=1[bg];"
+    "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[fg];"
+    "[bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
+)
+
+SPLIT_FILTER = (
+    "[0:v]crop=ih*9/8:ih:(iw-ih*9/8)/2:0,scale=1080:960:flags=lanczos,setsar=1[top];"
+    "[0:v]crop=iw*0.30:ih*0.30:iw*0.70:ih*0.70,scale=1080:960:flags=lanczos,setsar=1[bottom];"
+    "[top][bottom]vstack=inputs=2[v]"
+)
+
+
+class CropFilterResult(str):
+    """FFmpeg filter string enriched with computed layout metadata and detection coverage.
+
+    Subclasses str so it can be passed directly to FFmpeg command builders, format strings,
+    and existing legacy string-expecting functions without breaking backward compatibility.
+    """
+
+    layout_used: str
+    coverage: float
+    filter_str: str
+
+    def __new__(cls, filter_str: str, layout_used: str = "speaker", coverage: float = 0.0):
+        instance = super().__new__(cls, filter_str)
+        instance.layout_used = layout_used
+        instance.coverage = float(coverage)
+        instance.filter_str = filter_str
+        return instance
+
+    def __repr__(self) -> str:
+        return f"CropFilterResult('{self.filter_str}', layout_used='{self.layout_used}', coverage={self.coverage:.3f})"
+
+
+def compute_detection_coverage(samples: list[FaceSample]) -> float:
+    """Calculate the ratio of samples containing at least one valid detected face."""
+    if not samples:
+        return 0.0
+    valid_count = sum(1 for s in samples if s.primary_face is not None)
+    return float(valid_count / len(samples))
+
+
+def fill_face_timeline(
+    sample_times: list[float],
+    raw_centers: list[Optional[float]],
+    max_gap: Optional[float] = None,
+    ease_duration: Optional[float] = None,
+    neutral_position: Optional[float] = None,
+) -> list[float]:
+    """Fill face center timeline with bounded gaps and smooth easing toward neutral position.
+
+    1. Bounded backward-fill for leading gaps: fills up to max_gap; longer gaps ease from neutral.
+    2. Bounded forward-fill for trailing gaps: fills up to max_gap; longer gaps ease to neutral.
+    3. Intermediate gaps: gaps <= max_gap are linearly interpolated; gaps > max_gap ease to/from neutral.
+    4. Clips with zero detected faces default to neutral_position throughout.
+    """
+    n = len(sample_times)
+    if n == 0 or len(raw_centers) == 0:
+        return []
+
+    gap_limit = max_gap if max_gap is not None else getattr(settings, "FACE_MAX_GAP_FILL_SECONDS", 1.5)
+    ease_dur = ease_duration if ease_duration is not None else getattr(settings, "FACE_EASE_DURATION_SECONDS", 1.0)
+    neutral = neutral_position if neutral_position is not None else getattr(settings, "FACE_NEUTRAL_POSITION", 0.5)
+
+    valid_indices = [idx for idx, c in enumerate(raw_centers) if c is not None]
+    if not valid_indices:
+        return [neutral] * n
+
+    clean_centers: list[float] = []
+
+    for i in range(n):
+        c = raw_centers[i]
+        if c is not None:
+            clean_centers.append(c)
+            continue
+
+        t = sample_times[i]
+        prev_idx = max((j for j in valid_indices if j < i), default=None)
+        next_idx = min((j for j in valid_indices if j > i), default=None)
+
+        if prev_idx is None and next_idx is not None:
+            # Case 1: Leading gap before first face
+            t_next = sample_times[next_idx]
+            c_next = raw_centers[next_idx]
+            dt = t_next - t
+            if dt <= gap_limit:
+                clean_centers.append(c_next)
+            elif dt >= gap_limit + ease_dur:
+                clean_centers.append(neutral)
+            else:
+                progress = (gap_limit + ease_dur - dt) / ease_dur
+                val = neutral + progress * (c_next - neutral)
+                clean_centers.append(float(val))
+
+        elif next_idx is None and prev_idx is not None:
+            # Case 2: Trailing gap after last face
+            t_prev = sample_times[prev_idx]
+            c_prev = raw_centers[prev_idx]
+            dt = t - t_prev
+            if dt <= gap_limit:
+                clean_centers.append(c_prev)
+            elif dt >= gap_limit + ease_dur:
+                clean_centers.append(neutral)
+            else:
+                progress = (dt - gap_limit) / ease_dur
+                val = c_prev + progress * (neutral - c_prev)
+                clean_centers.append(float(val))
+
+        elif prev_idx is not None and next_idx is not None:
+            # Case 3: Intermediate gap between two detected faces
+            t_prev = sample_times[prev_idx]
+            c_prev = raw_centers[prev_idx]
+            t_next = sample_times[next_idx]
+            c_next = raw_centers[next_idx]
+            gap_dur = t_next - t_prev
+
+            if gap_dur <= gap_limit:
+                # Short gap: linear interpolation between previous and next face
+                ratio = (t - t_prev) / gap_dur if gap_dur > 0 else 0.5
+                val = c_prev + ratio * (c_next - c_prev)
+                clean_centers.append(float(val))
+            else:
+                # Long gap: forward-fill / ease on left, backward-fill / ease on right
+                dt_from_prev = t - t_prev
+                dt_to_next = t_next - t
+
+                if dt_from_prev <= dt_to_next:
+                    if dt_from_prev <= gap_limit:
+                        clean_centers.append(c_prev)
+                    elif dt_from_prev >= gap_limit + ease_dur:
+                        clean_centers.append(neutral)
+                    else:
+                        progress = (dt_from_prev - gap_limit) / ease_dur
+                        val = c_prev + progress * (neutral - c_prev)
+                        clean_centers.append(float(val))
+                else:
+                    if dt_to_next <= gap_limit:
+                        clean_centers.append(c_next)
+                    elif dt_to_next >= gap_limit + ease_dur:
+                        clean_centers.append(neutral)
+                    else:
+                        progress = (dt_to_next - gap_limit) / ease_dur
+                        val = c_next + progress * (neutral - c_next)
+                        clean_centers.append(float(val))
+        else:
+            clean_centers.append(neutral)
+
+    return clean_centers
+
+
 def compute_crop_filter(
     video_path: str,
     start_time: float,
     end_time: float,
     mode: str = "speaker",
     source_info: Optional[Any] = None,
-) -> str:
+    force_crop: bool = False,
+    coverage_threshold: Optional[float] = None,
+) -> CropFilterResult:
     """Compute crop/scale filter string for FFmpeg single-pass rendering using YuNet neural face detection."""
     if mode == "split":
         # Split screen layout: top gameplay, bottom webcam
-        return (
-            "[0:v]crop=ih*9/8:ih:(iw-ih*9/8)/2:0,scale=1080:960:flags=lanczos,setsar=1[top];"
-            "[0:v]crop=iw*0.30:ih*0.30:iw*0.70:ih*0.70,scale=1080:960:flags=lanczos,setsar=1[bottom];"
-            "[top][bottom]vstack=inputs=2[v]"
-        )
+        return CropFilterResult(SPLIT_FILTER, layout_used="split", coverage=1.0)
+
+    if mode == "fit_blur":
+        # Explicit fit with blurred background bars
+        return CropFilterResult(FIT_BLUR_FILTER, layout_used="fit_blur", coverage=0.0)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -399,10 +552,11 @@ def compute_crop_filter(
 
         # Handle Already-Vertical Source Videos
         if frame_w <= frame_h * 0.75 or crop_w >= frame_w:
-            return (
+            vert_filter = (
                 "scale=1080:1920:force_original_aspect_ratio=decrease,"
                 "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1"
             )
+            return CropFilterResult(vert_filter, layout_used="speaker", coverage=1.0)
 
         duration = max(0.1, end_time - start_time)
         samples = sample_faces_sequentially(
@@ -412,36 +566,30 @@ def compute_crop_filter(
             source_info=source_info,
         )
 
-        raw_centers: list[Optional[float]] = []
-        sample_times: list[float] = []
+        coverage = compute_detection_coverage(samples)
+        cov_thresh = (
+            coverage_threshold
+            if coverage_threshold is not None
+            else getattr(settings, "FACE_COVERAGE_THRESHOLD", 0.40)
+        )
 
-        if samples:
-            for s in samples:
-                sample_times.append(s.timestamp)
-                primary = s.primary_face
-                if primary is not None:
-                    raw_centers.append(float(primary.center_x / float(frame_w)))
-                else:
-                    raw_centers.append(None)
-        else:
-            sample_times = [start_time]
-            raw_centers = [0.5]
+        # Fall back to fit_blur if coverage is below threshold or zero faces detected
+        if (coverage < cov_thresh or coverage == 0.0) and not force_crop:
+            return CropFilterResult(FIT_BLUR_FILTER, layout_used="fit_blur", coverage=coverage)
 
-        # Carry forward last known valid face center_x (defaulting to 0.5 if no face was ever seen)
-        filled_centers: list[Optional[float]] = []
-        last_valid: Optional[float] = None
+        sample_times = [s.timestamp for s in samples] if samples else [start_time]
+        raw_centers = (
+            [
+                float(s.primary_face.center_x / float(frame_w))
+                if s.primary_face
+                else None
+                for s in samples
+            ]
+            if samples
+            else [0.5]
+        )
 
-        for c in raw_centers:
-            if c is not None:
-                last_valid = c
-                filled_centers.append(c)
-            elif last_valid is not None:
-                filled_centers.append(last_valid)
-            else:
-                filled_centers.append(None)
-
-        first_valid = next((c for c in raw_centers if c is not None), 0.5)
-        clean_centers = [c if c is not None else first_valid for c in filled_centers]
+        clean_centers = fill_face_timeline(sample_times, raw_centers)
 
         # 1.5-second rolling median filter
         sample_hz = getattr(settings, "FACE_DETECTION_SAMPLE_HZ", 4.0)
@@ -493,14 +641,16 @@ def compute_crop_filter(
                 else max(0, (frame_w - crop_w) // 2)
             )
             static_x = static_x - (static_x % 2)
-            return f"crop={crop_w}:{frame_h}:{static_x}:0,scale=1080:1920:flags=lanczos,setsar=1"
+            res_str = f"crop={crop_w}:{frame_h}:{static_x}:0,scale=1080:1920:flags=lanczos,setsar=1"
+            return CropFilterResult(res_str, layout_used="speaker", coverage=coverage)
 
         # Build dynamic piecewise if(lt(t, ...), ...) expression
         expr = str(merged_segments[-1][1])
         for t_cutoff, val in reversed(merged_segments[:-1]):
             expr = f"if(lt(t,{t_cutoff:.1f}),{val},{expr})"
 
-        return f"crop={crop_w}:{frame_h}:x='{expr}':y=0,scale=1080:1920:flags=lanczos,setsar=1"
+        res_str = f"crop={crop_w}:{frame_h}:x='{expr}':y=0,scale=1080:1920:flags=lanczos,setsar=1"
+        return CropFilterResult(res_str, layout_used="speaker", coverage=coverage)
 
     finally:
         cap.release()

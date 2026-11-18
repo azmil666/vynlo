@@ -26,7 +26,9 @@ interface ClipResult {
   hashtags?: string[];
   selection_method?: "llm" | "heuristic";
   selection_reason?: string;
-  layout_used?: "speaker" | "split";
+  layout_used?: "speaker" | "split" | "fit_blur";
+  detection_coverage?: number;
+  coverage?: number;
   detector?: string;
   caption_font?: string;
   render_ok?: boolean;
