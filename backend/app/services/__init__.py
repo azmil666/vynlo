@@ -26,7 +26,17 @@ from app.services.cache import (
     wait_for_single_flight_completion,
 )
 from app.services.captions import burn_subtitles, generate_ass_subtitles, render_clip_single_pass
-from app.services.cropper import crop_to_vertical, compute_crop_filter
+from app.services.cropper import (
+    DetectedFace,
+    FaceLandmarks,
+    FaceSample,
+    compute_crop_filter,
+    compute_scaled_detection_size,
+    crop_to_vertical,
+    detect_faces_in_frame,
+    sample_faces_sequentially,
+    verify_yunet_model_present,
+)
 from app.services.downloader import (
     classify_ytdlp_error,
     download_media,
@@ -70,6 +80,13 @@ __all__ = [
     "score_heuristic_window",
     "crop_to_vertical",
     "compute_crop_filter",
+    "compute_scaled_detection_size",
+    "detect_faces_in_frame",
+    "sample_faces_sequentially",
+    "verify_yunet_model_present",
+    "DetectedFace",
+    "FaceLandmarks",
+    "FaceSample",
     "generate_ass_subtitles",
     "burn_subtitles",
     "render_clip_single_pass",

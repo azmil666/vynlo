@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from celery import Celery
 from celery.exceptions import Retry, SoftTimeLimitExceeded
+from celery.signals import worker_process_init, worker_ready
 import cv2
 import redis
 
@@ -26,7 +27,11 @@ from app.schemas import (
 from app.services.downloader import download_media, get_video_metadata
 from app.services.transcriber import transcribe_audio
 from app.services.analyzer import find_viral_clips
-from app.services.cropper import _get_face_detector, compute_crop_filter
+from app.services.cropper import (
+    _get_face_detector,
+    compute_crop_filter,
+    verify_yunet_model_present,
+)
 from app.services.captions import generate_ass_subtitles, render_clip_single_pass
 from app.services.storage import upload_clip
 from app.services.sweeper import cleanup_stale_temp_dirs
@@ -53,6 +58,17 @@ celery_app.conf.update(
     broker_transport_options={"visibility_timeout": settings.broker_visibility_timeout},
     task_reject_on_worker_lost=False,
 )
+
+
+@worker_process_init.connect
+def on_worker_process_init(**kwargs: Any) -> None:
+    """Verify bundled AI/CV models at worker process initialization and fail fast if missing."""
+    try:
+        model_path = verify_yunet_model_present()
+        logger.info("YuNet face detection model verified at worker startup: %s", model_path)
+    except Exception as e:
+        logger.critical("Fatal: YuNet model missing or invalid at worker startup: %s", e)
+        raise
 
 _redis_client = None
 

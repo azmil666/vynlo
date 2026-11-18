@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     SNAP_INITIAL_WINDOW_SECONDS: float = 1.5
     SNAP_WIDENED_WINDOW_SECONDS: float = 3.0
 
+    # YuNet Neural Face Detection Configuration
+    YUNET_MODEL_PATH: str = "/app/models/face_detection_yunet_2023mar.onnx"
+    FACE_DETECTION_LONG_EDGE: int = 640
+    FACE_DETECTION_SAMPLE_HZ: float = 4.0
+    FACE_DETECTION_SCORE_THRESHOLD: float = 0.55
+    FACE_DETECTION_NMS_THRESHOLD: float = 0.3
+    FACE_DETECTION_TOP_K: int = 10
+
     # Cache Configuration, Schema Versions & Guard Thresholds
     GLOBAL_CACHE_VERSION: str = "v1"
     TRANSCRIPT_SCHEMA_VERSION: str = "v1"
