@@ -51,7 +51,19 @@ class JobErrorDetail(BaseModel):
         return self.message
 
 
-class PipelineError(Exception):
+class SourceInfo(BaseModel):
+    """Source video media metadata extracted from ffprobe."""
+    width: int
+    height: int
+    duration: float
+    has_audio: bool = True
+    rotation: int = 0
+    sar: str = "1:1"
+    avg_fps: float = 30.0
+    is_vfr: bool = False
+
+
+class PipelineError(ValueError):
     """Structured pipeline failure exception holding code, stage, retryable flag, user message, and detail."""
 
     def __init__(

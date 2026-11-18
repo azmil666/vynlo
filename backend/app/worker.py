@@ -174,15 +174,32 @@ def process_video_task(self, job_id: str, options: dict) -> None:
         url = options["url"]
         max_clips = int(options.get("max_clips", 3))
 
-        # 1. Resolve video_id via metadata with URL hash fallback
+        # 1. Resolve video_id via metadata with restricted fallback
+        meta_duration: Optional[float] = None
         try:
             meta = get_video_metadata(url)
             video_id = meta["video_id"]
-        except ValueError as e:
-            # Re-raise safety duration limits (e.g. > 4 hours)
+            meta_duration = meta.get("duration")
+            if meta_duration is None:
+                warnings_list.append({
+                    "code": "MISSING_METADATA_DURATION",
+                    "message": "Video metadata did not specify duration; duration limits will be enforced via ffprobe.",
+                })
+        except PipelineError:
+            # Re-raise classified pipeline errors immediately (no silent continuation)
             raise
         except Exception as e:
-            logger.warning("Metadata extraction failed for %s: %s. Using URL hash fallback.", url, e)
+            # Only for non-classified generic errors on direct media URLs: record warning,
+            # use URL-hash ID, and post-download validation will strictly enforce ffprobe duration.
+            logger.warning(
+                "Metadata extraction failed for %s: %s. Using URL hash fallback and enforcing duration post-download.",
+                url,
+                e,
+            )
+            warnings_list.append({
+                "code": "METADATA_FALLBACK_HASHED_ID",
+                "message": "Metadata extraction unavailable; using hashed URL id and enforcing duration via ffprobe.",
+            })
             url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
             video_id = f"url:{url_hash}"
 
@@ -196,9 +213,13 @@ def process_video_task(self, job_id: str, options: dict) -> None:
 
         # 3. Download media: skip audio extraction if transcript is already cached
         update_job_state("downloading", 10)
-        video_path, audio_path = download_media(
-            url, work_dir, extract_audio=(not has_cached_transcript)
+        video_path, audio_path, source_info, dl_warnings = download_media(
+            url,
+            work_dir,
+            extract_audio=(not has_cached_transcript),
+            meta_duration=meta_duration,
         )
+        warnings_list.extend(dl_warnings)
 
         # 4. Transcribe or load cached transcript
         update_job_state("transcribing", 30)
@@ -207,7 +228,24 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             words = json.loads(cached_words_raw)
         else:
             if not audio_path:
-                _, audio_path = download_media(url, work_dir, extract_audio=True)
+                audio_path = os.path.join(work_dir, "audio.wav")
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    video_path,
+                    "-vn",
+                    "-acodec",
+                    "pcm_s16le",
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    audio_path,
+                ]
+                subprocess.run(
+                    cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
             words = transcribe_audio(audio_path)
             r.set(transcript_cache_key, json.dumps(words), ex=604800)
 
@@ -268,6 +306,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 clip["start_time"],
                 clip["end_time"],
                 mode=layout_mode,
+                source_info=source_info,
             )
             generate_ass_subtitles(
                 words,

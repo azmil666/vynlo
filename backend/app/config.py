@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     WORKER_HEARTBEAT_TIMEOUT_SECONDS: int = 300
     TEMP_DIR_CLEANUP_HOURS: float = 4.0
 
+    # Video format selection and validation thresholds
+    MAX_VIDEO_HEIGHT: int = 1080
+    LONG_VIDEO_THRESHOLD_SECONDS: int = 600
+    LONG_VIDEO_MAX_HEIGHT: int = 720
+    DURATION_TOLERANCE_SECONDS: float = 15.0
+
     @property
     def task_soft_time_limit(self) -> int:
         """Derived task soft time limit based on stage budgets and video length.

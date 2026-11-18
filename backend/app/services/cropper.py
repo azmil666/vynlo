@@ -1,6 +1,6 @@
 import os
 import urllib.request
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -129,6 +129,7 @@ def compute_crop_filter(
     start_time: float,
     end_time: float,
     mode: str = "speaker",
+    source_info: Optional[Any] = None,
 ) -> str:
     """Compute crop/scale filter string for FFmpeg single-pass rendering using YuNet neural face detection."""
     if mode == "split":
@@ -146,6 +147,10 @@ def compute_crop_filter(
     try:
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Normalize dimensions if video stream contains rotation metadata
+        if source_info and getattr(source_info, "rotation", 0) in (90, 270):
+            frame_w, frame_h = frame_h, frame_w
 
         if frame_w <= 0 or frame_h <= 0:
             raise ValueError(

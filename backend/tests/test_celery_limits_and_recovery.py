@@ -71,7 +71,9 @@ def test_simulated_soft_time_limit(fake_redis):
         f.write("data")
 
     # Simulate task running and encountering SoftTimeLimitExceeded
-    with patch("app.worker.download_media", side_effect=SoftTimeLimitExceeded()):
+    with patch("app.worker.get_video_metadata", return_value={"video_id": "test:dummy", "duration": 60, "title": "Dummy"}), patch(
+        "app.worker.download_media", side_effect=SoftTimeLimitExceeded()
+    ):
         with pytest.raises(SoftTimeLimitExceeded):
             process_video_task(job_id, {"url": "https://youtu.be/dummy"})
 
