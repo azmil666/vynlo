@@ -1,7 +1,11 @@
+import json
 import os
 import re
+import signal
 import subprocess
 from typing import Any
+
+from app.schemas import PipelineError, PipelineErrorCode
 
 FONTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "fonts"))
 
@@ -599,6 +603,302 @@ def generate_ass_subtitles(
     return output_ass_path
 
 
+def check_faststart(mp4_path: str) -> bool:
+    """Verify that 'moov' atom appears before 'mdat' atom in an MP4 file."""
+    if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) < 16:
+        return False
+    moov_pos = None
+    mdat_pos = None
+    with open(mp4_path, "rb") as f:
+        pos = 0
+        file_size = os.path.getsize(mp4_path)
+        while pos < file_size:
+            header = f.read(8)
+            if len(header) < 8:
+                break
+            size = int.from_bytes(header[:4], "big")
+            atom = header[4:8]
+            if atom == b"moov" and moov_pos is None:
+                moov_pos = pos
+            elif atom == b"mdat" and mdat_pos is None:
+                mdat_pos = pos
+
+            if size == 1:
+                ext = f.read(8)
+                if len(ext) < 8:
+                    break
+                size = int.from_bytes(ext, "big")
+                pos += size
+                f.seek(pos)
+            elif size == 0:
+                # Atom extends to end of file
+                break
+            else:
+                pos += size
+                f.seek(pos)
+
+            if moov_pos is not None and mdat_pos is not None:
+                break
+
+    return moov_pos is not None and mdat_pos is not None and moov_pos < mdat_pos
+
+
+def probe_video_stream_info(video_path: str) -> dict:
+    """Probe source video for resolution, duration, and stream presence."""
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=index,codec_type,codec_name,width,height",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            video_path,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
+        data = json.loads(res.stdout)
+        streams = data.get("streams", [])
+        has_video = any(s.get("codec_type") == "video" for s in streams)
+        has_audio = any(s.get("codec_type") == "audio" for s in streams)
+        v_stream = next((s for s in streams if s.get("codec_type") == "video"), {})
+        width = int(v_stream.get("width") or 1920)
+        height = int(v_stream.get("height") or 1080)
+        raw_dur = data.get("format", {}).get("duration")
+        duration = float(raw_dur) if raw_dur is not None else 0.0
+        return {
+            "has_video": has_video,
+            "has_audio": has_audio,
+            "width": width,
+            "height": height,
+            "duration": duration,
+        }
+    except Exception:
+        return {
+            "has_video": True,
+            "has_audio": True,
+            "width": 1920,
+            "height": 1080,
+            "duration": 0.0,
+        }
+
+
+def measure_audio_loudness(
+    video_path: str,
+    start_time: float,
+    duration: float,
+    timeout: float = 30.0,
+) -> dict | None:
+    """Run pass 1 of loudnorm to measure EBU R128 parameters."""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_time:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        video_path,
+        "-vn",
+        "-af",
+        "loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        _, stderr = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            return None
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        json_match = re.search(r"\{[\s\S]*?\"input_i\"[\s\S]*?\}", stderr_text)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            if "input_i" in data and "input_tp" in data:
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def validate_rendered_clip(
+    output_path: str,
+    expected_duration: float,
+    duration_tolerance: float = 0.5,
+) -> None:
+    """Validate rendered MP4 with ffprobe for compliance and decodability."""
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Rendered clip is missing or empty.",
+            retryable=True,
+            detail=f"File {output_path} does not exist or has size 0.",
+        )
+
+    # 1. Probe format and streams
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration,size",
+        "-show_entries",
+        "stream=index,codec_type,codec_name,pix_fmt,width,height,sample_aspect_ratio",
+        "-of",
+        "json",
+        output_path,
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
+        probe_data = json.loads(res.stdout)
+    except Exception as e:
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Failed to inspect rendered clip with ffprobe.",
+            retryable=True,
+            detail=str(e),
+        )
+
+    streams = probe_data.get("streams", [])
+    v_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    a_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    # Check video stream
+    if not v_stream:
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Rendered clip is missing video stream.",
+            retryable=True,
+            detail="No video stream found in rendered clip.",
+        )
+    if v_stream.get("codec_name") != "h264":
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Rendered video stream is not H.264.",
+            retryable=True,
+            detail=f"Expected h264 codec, found {v_stream.get('codec_name')}.",
+        )
+    if v_stream.get("pix_fmt") != "yuv420p":
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Rendered video pixel format is not yuv420p.",
+            retryable=True,
+            detail=f"Expected yuv420p, found {v_stream.get('pix_fmt')}.",
+        )
+    width = int(v_stream.get("width") or 0)
+    height = int(v_stream.get("height") or 0)
+    if width != 1080 or height != 1920:
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Rendered video dimensions are not 1080x1920.",
+            retryable=True,
+            detail=f"Expected 1080x1920, got {width}x{height}.",
+        )
+
+    sar = v_stream.get("sample_aspect_ratio")
+    if sar and sar not in ("1:1", "1/1", "0:1"):
+        try:
+            num, den = map(float, sar.replace(":", "/").split("/", 1))
+            if abs(num / den - 1.0) > 0.02:
+                raise ValueError()
+        except Exception:
+            raise PipelineError(
+                code=PipelineErrorCode.RENDER_FAILED,
+                stage="rendering",
+                user_message="Rendered video does not have square pixels (SAR=1:1).",
+                retryable=True,
+                detail=f"Expected SAR=1:1, got {sar}.",
+            )
+
+    # Check audio stream
+    if not a_stream:
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Rendered clip is missing audio stream.",
+            retryable=True,
+            detail="No audio stream found in rendered clip.",
+        )
+    if a_stream.get("codec_name") != "aac":
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Rendered audio stream is not AAC.",
+            retryable=True,
+            detail=f"Expected aac codec, found {a_stream.get('codec_name')}.",
+        )
+
+    # Check duration
+    format_info = probe_data.get("format", {})
+    actual_dur = float(format_info.get("duration") or 0.0)
+    dur_diff = abs(actual_dur - expected_duration)
+    if dur_diff > duration_tolerance:
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Rendered clip duration deviates from requested duration.",
+            retryable=True,
+            detail=f"Expected duration {expected_duration:.2f}s, got {actual_dur:.2f}s (diff {dur_diff:.2f}s > {duration_tolerance:.2f}s).",
+        )
+
+    # Check faststart (moov before mdat)
+    if not check_faststart(output_path):
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Rendered clip is not faststart web-optimized (moov not before mdat).",
+            retryable=True,
+            detail="MP4 atom order check failed: 'moov' atom was not positioned before 'mdat'.",
+        )
+
+    # Decodability check of final frames
+    check_ss = max(0.0, actual_dur - 0.5)
+    decode_cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-ss",
+        f"{check_ss:.3f}",
+        "-i",
+        output_path,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        dec_res = subprocess.run(decode_cmd, capture_output=True, text=True, check=True, timeout=15)
+        if dec_res.stderr and "error" in dec_res.stderr.lower():
+            raise PipelineError(
+                code=PipelineErrorCode.RENDER_FAILED,
+                stage="rendering",
+                user_message="Final frames failed decodability validation.",
+                retryable=True,
+                detail=dec_res.stderr.strip(),
+            )
+    except subprocess.CalledProcessError as e:
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="Failed to decode final frames of rendered clip.",
+            retryable=True,
+            detail=e.stderr.strip() if e.stderr else str(e),
+        )
+
+
 def render_clip_single_pass(
     video_path: str,
     start_time: float,
@@ -607,13 +907,29 @@ def render_clip_single_pass(
     ass_path: str,
     output_path: str,
     fonts_dir: str = FONTS_DIR,
+    target_fps: int = 30,
+    timeout: float | None = None,
+    timeout_multiplier: float = 4.0,
+    base_timeout: float = 30.0,
+    validate_output: bool = True,
 ) -> str:
-    """Render 9:16 clip with crop, subtitles, and EBU R128 loudnorm in a single FFmpeg pass."""
+    """Render 9:16 clip with normalized frame rate, two-pass loudnorm, scaled timeout, and ffprobe validation."""
     out_dir = os.path.dirname(output_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    duration = max(0.1, end_time - start_time)
+    src_info = probe_video_stream_info(video_path)
+    if src_info["duration"] > 0 and end_time > src_info["duration"]:
+        effective_end = src_info["duration"]
+    else:
+        effective_end = end_time
+
+    duration = max(0.1, effective_end - start_time)
+
+    # Scale timeout to clip duration and source resolution
+    res_factor = max(1.0, (src_info["width"] * src_info["height"]) / (1920.0 * 1080.0))
+    calc_timeout = base_timeout + (duration * timeout_multiplier * res_factor)
+    actual_timeout = timeout if timeout is not None else calc_timeout
 
     # Input seeking before -i to decode only the target slice
     cmd = [
@@ -627,6 +943,38 @@ def render_clip_single_pass(
         video_path,
     ]
 
+    has_audio = src_info["has_audio"]
+    if has_audio:
+        # Two-pass loudnorm: measure then apply linearly
+        meas = measure_audio_loudness(
+            video_path,
+            start_time,
+            duration,
+            timeout=min(30.0, actual_timeout / 2.0),
+        )
+        if meas:
+            audio_filter = (
+                f"loudnorm=I=-14:TP=-1.5:LRA=11:"
+                f"measured_I={meas['input_i']}:"
+                f"measured_TP={meas['input_tp']}:"
+                f"measured_LRA={meas['input_lra']}:"
+                f"measured_thresh={meas['input_thresh']}:"
+                f"offset={meas['target_offset']}:"
+                f"linear=true"
+            )
+        else:
+            audio_filter = "loudnorm=I=-14:TP=-1.5:LRA=11"
+    else:
+        # Generate silent audio track matching clip duration
+        cmd.extend([
+            "-f",
+            "lavfi",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            "anullsrc=r=48000:cl=stereo",
+        ])
+
     has_ass = bool(ass_path and os.path.exists(ass_path))
     if has_ass:
         escaped_ass = (
@@ -636,35 +984,44 @@ def render_clip_single_pass(
     else:
         ass_filter = ""
 
-    # Chain crop filter and subtitle burning in a single pass
+    crop_filter_str = str(crop_filter) if crop_filter else ""
     is_complex = (
-        ";[0:v]" in crop_filter
-        or "[top]" in crop_filter
-        or "[bottom]" in crop_filter
-        or "[v]" in crop_filter
+        ";[0:v]" in crop_filter_str
+        or "[top]" in crop_filter_str
+        or "[bottom]" in crop_filter_str
+        or "[v]" in crop_filter_str
     )
 
     if is_complex:
+        base = crop_filter_str.rstrip(";")
+        if base.endswith("[v]"):
+            base = base[:-3] + "[v_crop]"
         if has_ass:
-            base = crop_filter.rstrip(";")
-            if base.endswith("[v]"):
-                base = base[:-3] + "[v_crop]"
-            filter_complex = f"{base};[v_crop]{ass_filter}[v]"
+            filter_complex = f"{base};[v_crop]{ass_filter},fps=fps={target_fps},setsar=1,format=yuv420p[v]"
         else:
-            filter_complex = crop_filter
-        cmd.extend(["-filter_complex", filter_complex, "-map", "[v]", "-map", "0:a?"])
+            filter_complex = f"{base};[v_crop]fps=fps={target_fps},setsar=1,format=yuv420p[v]"
     else:
+        vf_parts = []
+        if crop_filter_str:
+            vf_parts.append(crop_filter_str)
         if has_ass:
-            vf = f"{crop_filter},{ass_filter}" if crop_filter else ass_filter
-        else:
-            vf = crop_filter if crop_filter else "null"
-        filter_complex = f"[0:v]{vf}[v]"
-        cmd.extend(["-filter_complex", filter_complex, "-map", "[v]", "-map", "0:a?"])
+            vf_parts.append(ass_filter)
+        vf_parts.append(f"fps=fps={target_fps}")
+        vf_parts.append("setsar=1")
+        vf_parts.append("format=yuv420p")
+        filter_complex = f"[0:v]{','.join(vf_parts)}[v]"
 
-    # EBU R128 loudness normalization and single-pass encoding
+    cmd.extend(["-filter_complex", filter_complex, "-map", "[v]"])
+
+    if has_audio:
+        cmd.extend(["-map", "0:a:0?", "-af", audio_filter])
+    else:
+        cmd.extend(["-map", "1:a"])
+
+    # Output encoding: CFR, H.264, yuv420p, web-optimized faststart, 48kHz stereo AAC
     cmd.extend([
-        "-af",
-        "loudnorm=I=-14:TP=-1.5:LRA=11",
+        "-fps_mode",
+        "cfr",
         "-c:v",
         "libx264",
         "-preset",
@@ -679,16 +1036,57 @@ def render_clip_single_pass(
         "aac",
         "-b:a",
         "128k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
         output_path,
     ])
 
-    subprocess.run(
+    # Run FFmpeg in a new process group to enable clean termination on timeout
+    proc = subprocess.Popen(
         cmd,
-        check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=180,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=actual_timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+        proc.communicate()
+        raise PipelineError(
+            code=PipelineErrorCode.TIMEOUT,
+            stage="rendering",
+            user_message=f"Rendering clip timed out after {actual_timeout:.1f}s.",
+            retryable=True,
+            detail=f"FFmpeg process group {proc.pid} killed after exceeding {actual_timeout:.1f}s timeout.",
+        )
+    except Exception as e:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+        proc.communicate()
+        raise
+
+    if proc.returncode != 0:
+        stderr_text = stderr.decode("utf-8", errors="replace")
+        stderr_tail = "\n".join(stderr_text.splitlines()[-25:])
+        raise PipelineError(
+            code=PipelineErrorCode.RENDER_FAILED,
+            stage="rendering",
+            user_message="FFmpeg failed to render clip.",
+            retryable=True,
+            detail=f"FFmpeg exited with code {proc.returncode}. Stderr tail:\n{stderr_tail}",
+        )
+
+    if validate_output:
+        validate_rendered_clip(output_path, expected_duration=duration)
+
     return output_path
 
 
@@ -698,10 +1096,12 @@ def burn_subtitles(
     output_video_path: str,
 ) -> str:
     """Legacy helper: burn subtitles into an existing video."""
+    src = probe_video_stream_info(input_video_path)
+    end = src["duration"] if src["duration"] > 0 else 999999.0
     return render_clip_single_pass(
         video_path=input_video_path,
         start_time=0.0,
-        end_time=999999.0,
+        end_time=end,
         crop_filter="",
         ass_path=ass_path,
         output_path=output_video_path,

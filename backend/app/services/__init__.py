@@ -27,14 +27,18 @@ from app.services.cache import (
 )
 from app.services.captions import (
     burn_subtitles,
+    check_faststart,
     check_missing_glyphs,
     detect_script,
     filter_and_trim_words,
     generate_ass_subtitles,
     group_words_into_captions,
     is_valid_hook_title,
+    measure_audio_loudness,
+    probe_video_stream_info,
     render_clip_single_pass,
     sanitize_ass_text,
+    validate_rendered_clip,
     verify_font_rendering,
 )
 from app.services.cropper import (
@@ -149,6 +153,10 @@ __all__ = [
     "is_valid_hook_title",
     "sanitize_ass_text",
     "verify_font_rendering",
+    "check_faststart",
+    "probe_video_stream_info",
+    "measure_audio_loudness",
+    "validate_rendered_clip",
     "upload_clip",
     "find_webcam_region",
     "compute_split_pane_boxes",
