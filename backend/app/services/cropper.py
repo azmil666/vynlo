@@ -10,8 +10,9 @@ Uses OpenCV's neural FaceDetectorYN (YuNet 2023mar ONNX model) with:
 
 import hashlib
 import logging
+import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import cv2
@@ -73,6 +74,430 @@ class FaceSample:
         if not self.faces:
             return None
         return self.faces[0]  # Pre-sorted by area * score descending
+
+
+@dataclass
+class TrackedDetection:
+    """Face detection associated with a track at timestamp t."""
+    timestamp: float
+    face: DetectedFace
+    norm_mouth_dist: float
+
+
+@dataclass
+class FaceTrack:
+    """Continuous temporal track of a detected face across samples."""
+    track_id: int
+    detections: list[TrackedDetection] = field(default_factory=list)
+
+    @property
+    def start_time(self) -> float:
+        return self.detections[0].timestamp if self.detections else 0.0
+
+    @property
+    def end_time(self) -> float:
+        return self.detections[-1].timestamp if self.detections else 0.0
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end_time - self.start_time)
+
+    @property
+    def count(self) -> int:
+        return len(self.detections)
+
+    @property
+    def mean_area(self) -> float:
+        if not self.detections:
+            return 0.0
+        return sum(d.face.area for d in self.detections) / len(self.detections)
+
+    def get_detection_at_time(self, t: float, max_dt: float = 0.5) -> Optional[TrackedDetection]:
+        """Find the detection closest to time t within max_dt."""
+        best: Optional[TrackedDetection] = None
+        best_dt = max_dt
+        for d in self.detections:
+            dt = abs(d.timestamp - t)
+            if dt < best_dt:
+                best_dt = dt
+                best = d
+        return best
+
+
+def compute_normalized_mouth_distance(face: DetectedFace) -> float:
+    """Compute Euclidean distance between mouth corners normalized by face box size."""
+    if not face.landmarks:
+        return 0.0
+    lm = face.landmarks
+    dx = lm.mouth_right[0] - lm.mouth_left[0]
+    dy = lm.mouth_right[1] - lm.mouth_left[1]
+    dist = math.sqrt(dx * dx + dy * dy)
+    face_size = max(face.box[2], face.box[3], 1.0)
+    return dist / face_size
+
+
+def calculate_box_iou(
+    box1: tuple[float, float, float, float],
+    box2: tuple[float, float, float, float],
+) -> float:
+    """Compute Intersection-over-Union (IoU) between two bounding boxes (x, y, w, h)."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[0] + box1[2], box2[0] + box2[2])
+    y2 = min(box1[1] + box1[3], box2[1] + box2[3])
+
+    inter_w = max(0.0, x2 - x1)
+    inter_h = max(0.0, y2 - y1)
+    inter_area = inter_w * inter_h
+
+    area1 = max(0.0, box1[2]) * max(0.0, box1[3])
+    area2 = max(0.0, box2[2]) * max(0.0, box2[3])
+    union_area = area1 + area2 - inter_area
+
+    if union_area <= 0.0:
+        return 0.0
+    return inter_area / union_area
+
+
+def track_faces_across_samples(
+    samples: list[FaceSample],
+    iou_threshold: Optional[float] = None,
+    max_gap: Optional[float] = None,
+) -> list[FaceTrack]:
+    """Track faces across consecutive samples using IoU and spatial proximity association."""
+    iou_thresh = (
+        iou_threshold
+        if iou_threshold is not None
+        else getattr(settings, "SPEAKER_IOU_THRESHOLD", 0.25)
+    )
+    gap_limit = (
+        max_gap
+        if max_gap is not None
+        else getattr(settings, "SPEAKER_MAX_TRACK_GAP_SECONDS", 1.5)
+    )
+
+    tracks: list[FaceTrack] = []
+    next_track_id = 1
+
+    for sample in samples:
+        t = sample.timestamp
+        faces = sorted(sample.faces, key=lambda f: f.area * f.score, reverse=True)
+        active_tracks = [tr for tr in tracks if (t - tr.end_time) <= gap_limit]
+
+        pair_scores: list[tuple[float, int, int]] = []
+        for tr_idx, tr in enumerate(active_tracks):
+            last_det = tr.detections[-1]
+            last_box = last_det.face.box
+            for f_idx, face in enumerate(faces):
+                iou = calculate_box_iou(last_box, face.box)
+                dx = last_det.face.center_x - face.center_x
+                dy = last_det.face.center_y - face.center_y
+                center_dist = math.sqrt(dx * dx + dy * dy)
+                max_dim = max(last_box[2], last_box[3], face.box[2], face.box[3], 1.0)
+                norm_dist = center_dist / max_dim
+
+                score = 0.0
+                if iou >= iou_thresh:
+                    score = iou
+                elif norm_dist < 0.6:
+                    score = 1.0 / (1.0 + norm_dist)
+
+                if score > 0.0:
+                    pair_scores.append((score, tr_idx, f_idx))
+
+        pair_scores.sort(key=lambda x: x[0], reverse=True)
+
+        matched_tracks: set[int] = set()
+        matched_faces: set[int] = set()
+
+        for score, tr_idx, f_idx in pair_scores:
+            tr = active_tracks[tr_idx]
+            if tr.track_id in matched_tracks or f_idx in matched_faces:
+                continue
+
+            matched_tracks.add(tr.track_id)
+            matched_faces.add(f_idx)
+            face = faces[f_idx]
+            d_norm = compute_normalized_mouth_distance(face)
+            tr.detections.append(TrackedDetection(timestamp=t, face=face, norm_mouth_dist=d_norm))
+
+        for f_idx, face in enumerate(faces):
+            if f_idx not in matched_faces:
+                d_norm = compute_normalized_mouth_distance(face)
+                new_track = FaceTrack(
+                    track_id=next_track_id,
+                    detections=[TrackedDetection(timestamp=t, face=face, norm_mouth_dist=d_norm)],
+                )
+                next_track_id += 1
+                tracks.append(new_track)
+
+    return tracks
+
+
+def compute_track_speaking_score(
+    track: FaceTrack,
+    t: float,
+    window_sec: float = 1.0,
+    noise_floor: float = 1e-4,
+) -> float:
+    """Compute speaking score as normalized mouth-distance variance over rolling window around t."""
+    half_w = window_sec / 2.0
+    window_dists = [
+        d.norm_mouth_dist
+        for d in track.detections
+        if (t - half_w) <= d.timestamp <= (t + half_w)
+    ]
+    if len(window_dists) < 2:
+        return 0.0
+    var = float(np.var(window_dists))
+    return max(0.0, var - noise_floor)
+
+
+def is_speech_active_at(
+    t: float,
+    speech_intervals: list[tuple[float, float]],
+    margin: float = 0.3,
+) -> bool:
+    """Return whether speech is active at time t within margin.
+    If speech_intervals is empty, returns True (unconstrained).
+    """
+    if not speech_intervals:
+        return True
+    return any(start - margin <= t <= end + margin for start, end in speech_intervals)
+
+
+def assess_speaker_tracking_reliability(
+    tracks: list[FaceTrack],
+    min_face_size: float = 35.0,
+    min_mouth_width: float = 3.0,
+) -> tuple[bool, Optional[str]]:
+    """Assess whether facial landmarks and resolution are reliable for active speaker tracking."""
+    if not tracks:
+        return False, "No face tracks available"
+
+    all_detections = [d for tr in tracks for d in tr.detections]
+    if not all_detections:
+        return False, "No face detections found"
+
+    face_sizes = [max(d.face.box[2], d.face.box[3]) for d in all_detections]
+    med_size = float(np.median(face_sizes)) if face_sizes else 0.0
+    if med_size < min_face_size:
+        return False, f"Low face resolution (median dimension {med_size:.1f}px < {min_face_size:.0f}px)"
+
+    mouth_widths: list[float] = []
+    for d in all_detections:
+        if d.face.landmarks:
+            dx = d.face.landmarks.mouth_right[0] - d.face.landmarks.mouth_left[0]
+            dy = d.face.landmarks.mouth_right[1] - d.face.landmarks.mouth_left[1]
+            mouth_widths.append(math.sqrt(dx * dx + dy * dy))
+
+    if not mouth_widths:
+        return False, "No facial landmarks detected"
+
+    med_mouth = float(np.median(mouth_widths))
+    if med_mouth < min_mouth_width:
+        return False, f"Degenerate mouth landmarks (median mouth width {med_mouth:.1f}px < {min_mouth_width:.0f}px)"
+
+    return True, None
+
+
+def select_active_speaker_trajectory(
+    samples: list[FaceSample],
+    frame_w: int,
+    frame_h: int,
+    crop_w: int,
+    words: Optional[list[dict]] = None,
+    min_dwell_sec: Optional[float] = None,
+    switch_margin: Optional[float] = None,
+    mouth_window_sec: Optional[float] = None,
+    noise_floor: Optional[float] = None,
+    dual_frame_ratio: Optional[float] = None,
+) -> tuple[list[Optional[float]], list[str]]:
+    """Select horizontal crop centers [0.0, 1.0] across samples following the active speaker.
+
+    Features:
+    1. Per-face tracking across samples via IoU and nearest-box association.
+    2. Per-track speaking score based on normalized mouth-corner distance variance.
+    3. Hysteresis switching: requires minimum dwell time and score margin above current speaker;
+       holds current speaker through short pauses.
+    4. Dual-speaker framing: if two active speakers fit within crop_w with margin, frames both.
+    5. Fallback: if landmarks or resolution are unreliable, falls back to largest stable track and records warning.
+
+    Returns:
+        (raw_centers, warnings)
+    """
+    if not samples:
+        return [0.5], []
+
+    dwell_time = (
+        min_dwell_sec
+        if min_dwell_sec is not None
+        else getattr(settings, "SPEAKER_MIN_DWELL_SECONDS", 2.0)
+    )
+    margin = (
+        switch_margin
+        if switch_margin is not None
+        else getattr(settings, "SPEAKER_SWITCH_MARGIN", 1.3)
+    )
+    window_sec = (
+        mouth_window_sec
+        if mouth_window_sec is not None
+        else getattr(settings, "SPEAKER_MOUTH_WINDOW_SECONDS", 1.0)
+    )
+    floor = (
+        noise_floor
+        if noise_floor is not None
+        else getattr(settings, "SPEAKER_MOUTH_NOISE_FLOOR", 1e-4)
+    )
+    dual_ratio = (
+        dual_frame_ratio
+        if dual_frame_ratio is not None
+        else getattr(settings, "SPEAKER_DUAL_FRAME_MAX_RATIO", 0.85)
+    )
+
+    speech_intervals: list[tuple[float, float]] = []
+    if words:
+        for w in words:
+            if isinstance(w, dict) and "start" in w and "end" in w:
+                try:
+                    speech_intervals.append((float(w["start"]), float(w["end"])))
+                except (ValueError, TypeError):
+                    pass
+
+    tracks = track_faces_across_samples(samples)
+    if not tracks:
+        return [None] * len(samples), []
+
+    # Single-face optimization: track directly without multi-face switching
+    if len(tracks) == 1:
+        single_track = tracks[0]
+        raw_centers = [
+            float(det.face.center_x / float(frame_w))
+            if (det := single_track.get_detection_at_time(s.timestamp, max_dt=0.5))
+            else None
+            for s in samples
+        ]
+        return raw_centers, []
+
+    # Assess reliability of facial landmarks & resolution across tracks
+    min_face_size = getattr(settings, "SPEAKER_MIN_FACE_SIZE_PX", 35.0)
+    reliable, unreliability_reason = assess_speaker_tracking_reliability(
+        tracks, min_face_size=min_face_size
+    )
+
+    warnings: list[str] = []
+    if not reliable:
+        warn_msg = (
+            f"Face landmarks or resolution unreliable for active speaker tracking "
+            f"({unreliability_reason}); fell back to largest stable track."
+        )
+        warnings.append(warn_msg)
+        logger.warning(warn_msg)
+
+        largest_track = max(tracks, key=lambda tr: tr.mean_area * tr.count)
+        fallback_centers: list[Optional[float]] = []
+        for s in samples:
+            det = largest_track.get_detection_at_time(s.timestamp, max_dt=0.5)
+            if det:
+                fallback_centers.append(float(det.face.center_x / float(frame_w)))
+            else:
+                fallback_centers.append(None)
+        return fallback_centers, warnings
+
+    # Multi-speaker tracking with dual-framing & hysteresis
+    raw_centers: list[Optional[float]] = []
+    current_speaker_track: Optional[FaceTrack] = None
+    speaker_switch_time: float = -999.0
+
+    for s in samples:
+        t = s.timestamp
+        active_pairs: list[tuple[FaceTrack, TrackedDetection]] = []
+        for tr in tracks:
+            det = tr.get_detection_at_time(t, max_dt=0.5)
+            if det is not None:
+                active_pairs.append((tr, det))
+
+        if not active_pairs:
+            raw_centers.append(None)
+            continue
+
+        active_pairs.sort(key=lambda p: p[1].face.area * p[1].face.score, reverse=True)
+
+        # -------------------------------------------------------------
+        # 1. Dual-Speaker Framing Check
+        # -------------------------------------------------------------
+        dual_framed = False
+        if len(active_pairs) >= 2:
+            p1, p2 = active_pairs[0], active_pairs[1]
+            area1, area2 = p1[1].face.area, p2[1].face.area
+            if area2 >= 0.25 * area1:
+                box1, box2 = p1[1].face.box, p2[1].face.box
+                x_min = min(box1[0], box2[0])
+                x_max = max(box1[0] + box1[2], box2[0] + box2[2])
+                span = x_max - x_min
+                if span <= crop_w * dual_ratio:
+                    both_center = (x_min + x_max) / 2.0
+                    raw_centers.append(float(both_center / float(frame_w)))
+                    dual_framed = True
+
+        if dual_framed:
+            continue
+
+        # -------------------------------------------------------------
+        # 2. Active Speaker Selection with Hysteresis
+        # -------------------------------------------------------------
+        if current_speaker_track is None:
+            best_init_track = active_pairs[0][0]
+            best_init_score = -1.0
+            for tr, _ in active_pairs:
+                sc = compute_track_speaking_score(tr, t, window_sec, floor)
+                if sc > best_init_score:
+                    best_init_score = sc
+                    best_init_track = tr
+            current_speaker_track = best_init_track
+            speaker_switch_time = t
+
+        # If previous speaker hasn't been seen for > 1.5s, transfer focus to primary visible track
+        if (t - current_speaker_track.end_time) > getattr(settings, "FACE_MAX_GAP_FILL_SECONDS", 1.5):
+            current_speaker_track = active_pairs[0][0]
+            speaker_switch_time = t
+
+        track_scores = {
+            tr.track_id: compute_track_speaking_score(tr, t, window_sec, floor)
+            for tr, _ in active_pairs
+        }
+
+        speech_on = is_speech_active_at(t, speech_intervals)
+        dwell = t - speaker_switch_time
+
+        # Switch only if speech is active, dwell time satisfied, and challenger beats margin
+        if speech_on and dwell >= dwell_time:
+            curr_score = track_scores.get(current_speaker_track.track_id, 0.0)
+            best_challenger_track: Optional[FaceTrack] = None
+            best_challenger_score = 0.0
+            for tr, _ in active_pairs:
+                if tr.track_id == current_speaker_track.track_id:
+                    continue
+                sc = track_scores.get(tr.track_id, 0.0)
+                if sc > best_challenger_score:
+                    best_challenger_score = sc
+                    best_challenger_track = tr
+
+            if (
+                best_challenger_track is not None
+                and best_challenger_score > floor
+                and best_challenger_score > (curr_score * margin)
+            ):
+                current_speaker_track = best_challenger_track
+                speaker_switch_time = t
+
+        det = current_speaker_track.get_detection_at_time(t, max_dt=0.5)
+        if det is not None:
+            raw_centers.append(float(det.face.center_x / float(frame_w)))
+        else:
+            raw_centers.append(None)
+
+    return raw_centers, warnings
 
 
 # ============================================================================
@@ -386,16 +811,25 @@ class CropFilterResult(str):
     layout_used: str
     coverage: float
     filter_str: str
+    warnings: list[str]
 
-    def __new__(cls, filter_str: str, layout_used: str = "speaker", coverage: float = 0.0):
+    def __new__(
+        cls,
+        filter_str: str,
+        layout_used: str = "speaker",
+        coverage: float = 0.0,
+        warnings: Optional[list[str]] = None,
+    ):
         instance = super().__new__(cls, filter_str)
         instance.layout_used = layout_used
         instance.coverage = float(coverage)
         instance.filter_str = filter_str
+        instance.warnings = list(warnings or [])
         return instance
 
     def __repr__(self) -> str:
-        return f"CropFilterResult('{self.filter_str}', layout_used='{self.layout_used}', coverage={self.coverage:.3f})"
+        warn_str = f", warnings={len(self.warnings)}" if self.warnings else ""
+        return f"CropFilterResult('{self.filter_str}', layout_used='{self.layout_used}', coverage={self.coverage:.3f}{warn_str})"
 
 
 def compute_detection_coverage(samples: list[FaceSample]) -> float:
@@ -700,6 +1134,7 @@ def compute_crop_filter(
     source_info: Optional[Any] = None,
     force_crop: bool = False,
     coverage_threshold: Optional[float] = None,
+    words: Optional[list[dict]] = None,
 ) -> CropFilterResult:
     """Compute crop/scale filter string for FFmpeg single-pass rendering using YuNet neural face detection."""
     if mode == "split":
@@ -756,16 +1191,28 @@ def compute_crop_filter(
             return CropFilterResult(FIT_BLUR_FILTER, layout_used="fit_blur", coverage=coverage)
 
         sample_times = [s.timestamp for s in samples] if samples else [start_time]
-        raw_centers = (
-            [
-                float(s.primary_face.center_x / float(frame_w))
-                if s.primary_face
-                else None
-                for s in samples
-            ]
-            if samples
-            else [0.5]
-        )
+
+        filter_warnings: list[str] = []
+        if getattr(settings, "SPEAKER_TRACKING_ENABLED", True) and samples:
+            raw_centers, spk_warnings = select_active_speaker_trajectory(
+                samples=samples,
+                frame_w=frame_w,
+                frame_h=frame_h,
+                crop_w=crop_w,
+                words=words,
+            )
+            filter_warnings.extend(spk_warnings)
+        else:
+            raw_centers = (
+                [
+                    float(s.primary_face.center_x / float(frame_w))
+                    if s.primary_face
+                    else None
+                    for s in samples
+                ]
+                if samples
+                else [0.5]
+            )
 
         clean_centers = fill_face_timeline(sample_times, raw_centers)
 
@@ -791,7 +1238,12 @@ def compute_crop_filter(
         else:
             res_str = f"crop={crop_w}:{frame_h}:x='{crop_expr}':y=0,scale=1080:1920:flags=lanczos,setsar=1"
 
-        return CropFilterResult(res_str, layout_used="speaker", coverage=coverage)
+        return CropFilterResult(
+            res_str,
+            layout_used="speaker",
+            coverage=coverage,
+            warnings=filter_warnings,
+        )
 
     finally:
         cap.release()
@@ -803,9 +1255,10 @@ def crop_to_vertical(
     end_time: float,
     output_path: str,
     mode: str = "speaker",
+    words: Optional[list[dict]] = None,
 ) -> str:
     """Crop video segment [start_time, end_time] to vertical 9:16 (1080x1920)."""
-    crop_filter = compute_crop_filter(video_path, start_time, end_time, mode=mode)
+    crop_filter = compute_crop_filter(video_path, start_time, end_time, mode=mode, words=words)
     from app.services.captions import render_clip_single_pass
 
     return render_clip_single_pass(

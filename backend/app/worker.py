@@ -385,6 +385,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 clip["end_time"],
                 mode=layout_mode,
                 source_info=source_info,
+                words=words,
             )
             actual_layout = getattr(crop_filter, "layout_used", layout_mode)
             clip_coverage = getattr(crop_filter, "coverage", None)
@@ -403,6 +404,16 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                             f"({settings.FACE_COVERAGE_THRESHOLD * 100:.0f}%). "
                             f"Used '{actual_layout}' layout instead of requested '{layout_mode}'."
                         ),
+                        clip_index=i,
+                    )
+                )
+
+            crop_warnings = getattr(crop_filter, "warnings", [])
+            for cw in crop_warnings:
+                warnings_list.append(
+                    JobWarning(
+                        code="SPEAKER_TRACKING_FALLBACK",
+                        message=f"Clip {i}: {cw}",
                         clip_index=i,
                     )
                 )

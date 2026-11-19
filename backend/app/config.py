@@ -57,6 +57,17 @@ class Settings(BaseSettings):
     CROP_SIMPLIFY_EPSILON: float = 2.0
     CROP_MAX_KEYFRAMES: int = 40
 
+    # Active Speaker Tracking & Selection
+    SPEAKER_TRACKING_ENABLED: bool = True
+    SPEAKER_MIN_DWELL_SECONDS: float = 2.0
+    SPEAKER_SWITCH_MARGIN: float = 1.3
+    SPEAKER_MOUTH_WINDOW_SECONDS: float = 1.0
+    SPEAKER_MOUTH_NOISE_FLOOR: float = 1e-4
+    SPEAKER_DUAL_FRAME_MAX_RATIO: float = 0.85
+    SPEAKER_IOU_THRESHOLD: float = 0.25
+    SPEAKER_MAX_TRACK_GAP_SECONDS: float = 1.5
+    SPEAKER_MIN_FACE_SIZE_PX: int = 35
+
     # Cache Configuration, Schema Versions & Guard Thresholds
     GLOBAL_CACHE_VERSION: str = "v1"
     TRANSCRIPT_SCHEMA_VERSION: str = "v1"
