@@ -182,5 +182,59 @@ export interface HTTPValidationError {
   detail?: ValidationError[];
 }
 
+/** System health inspection reporting Redis, queue, worker, and storage readiness. */
+export interface HealthCheckResponse {
+  /** Overall system status: 'ok', 'degraded', or 'unhealthy'. */
+  status: string;
+  /** Service identifier. */
+  service?: string;
+  /** Deployment environment. */
+  environment?: string;
+  /** ISO-8601 UTC timestamp of the health check evaluation. */
+  timestamp: string;
+  /** Redis connection and latency status. */
+  redis: HealthComponentStatus;
+  /** Celery queue depth and active jobs status. */
+  queue: QueueHealthStatus;
+  /** Worker cluster availability and ping status. */
+  workers: WorkerHealthStatus;
+  /** Storage backend writability status. */
+  storage: HealthComponentStatus;
+}
+
+/** Health status of an individual subsystem component. */
+export interface HealthComponentStatus {
+  /** Component status: 'ok', 'degraded', or 'unhealthy'. */
+  status: string;
+  /** Round-trip latency in milliseconds if applicable. */
+  latency_ms?: number | null;
+  /** Diagnostic detail or failure message. */
+  detail?: string | null;
+}
+
+/** Health status and depth metrics of the job execution queue. */
+export interface QueueHealthStatus {
+  /** Queue status: 'ok', 'degraded', or 'unhealthy'. */
+  status: string;
+  /** Number of tasks waiting in Celery queue. */
+  depth?: number;
+  /** Number of jobs currently processing in active stages. */
+  active_jobs?: number;
+  /** Diagnostic detail or queue backlog note. */
+  detail?: string | null;
+}
+
+/** Health status and discovery metrics for background workers. */
+export interface WorkerHealthStatus {
+  /** Worker pool status: 'ok', 'degraded', or 'unhealthy'. */
+  status: string;
+  /** Count of responsive Celery worker processes. */
+  active_workers?: number;
+  /** Hostnames/IDs of responsive workers. */
+  worker_names?: string[];
+  /** Diagnostic detail or worker pool note. */
+  detail?: string | null;
+}
+
 /** Backwards-compatible alias for JobStatusResponse. */
 export type JobStatus = JobStatusResponse;

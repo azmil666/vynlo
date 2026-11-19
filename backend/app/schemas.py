@@ -488,3 +488,39 @@ def map_exception_to_pipeline_error(
         detail=f"{type(exc).__name__}: {msg}\n{tb}",
     )
 
+
+class HealthComponentStatus(BaseModel):
+    """Health status of an individual subsystem component."""
+    status: str = Field(description="Component status: 'ok', 'degraded', or 'unhealthy'.")
+    latency_ms: Optional[float] = Field(default=None, description="Round-trip latency in milliseconds if applicable.")
+    detail: Optional[str] = Field(default=None, description="Diagnostic detail or failure message.")
+
+
+class QueueHealthStatus(BaseModel):
+    """Health status and depth metrics of the job execution queue."""
+    status: str = Field(description="Queue status: 'ok', 'degraded', or 'unhealthy'.")
+    depth: int = Field(default=0, description="Number of tasks waiting in Celery queue.")
+    active_jobs: int = Field(default=0, description="Number of jobs currently processing in active stages.")
+    detail: Optional[str] = Field(default=None, description="Diagnostic detail or queue backlog note.")
+
+
+class WorkerHealthStatus(BaseModel):
+    """Health status and discovery metrics for background workers."""
+    status: str = Field(description="Worker pool status: 'ok', 'degraded', or 'unhealthy'.")
+    active_workers: int = Field(default=0, description="Count of responsive Celery worker processes.")
+    worker_names: list[str] = Field(default_factory=list, description="Hostnames/IDs of responsive workers.")
+    detail: Optional[str] = Field(default=None, description="Diagnostic detail or worker pool note.")
+
+
+class HealthCheckResponse(BaseModel):
+    """System health inspection reporting Redis, queue, worker, and storage readiness."""
+    status: str = Field(description="Overall system status: 'ok', 'degraded', or 'unhealthy'.")
+    service: str = Field(default="clipper-api", description="Service identifier.")
+    environment: str = Field(default="development", description="Deployment environment.")
+    timestamp: str = Field(description="ISO-8601 UTC timestamp of the health check evaluation.")
+    redis: HealthComponentStatus = Field(description="Redis connection and latency status.")
+    queue: QueueHealthStatus = Field(description="Celery queue depth and active jobs status.")
+    workers: WorkerHealthStatus = Field(description="Worker cluster availability and ping status.")
+    storage: HealthComponentStatus = Field(description="Storage backend writability status.")
+
+

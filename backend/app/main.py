@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import io
+import json
 import logging
 import os
 import re
@@ -9,7 +10,8 @@ import urllib.request
 from uuid import uuid4
 import zipfile
 
-from fastapi import FastAPI, HTTPException, status
+import time
+from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,15 +19,20 @@ import redis
 
 from app.config import settings, validate_retention_config
 from app.schemas import (
+    HealthCheckResponse,
+    HealthComponentStatus,
     JobCreateRequest,
     JobErrorDetail,
     JobStatusResponse,
     PipelineErrorCode,
+    QueueHealthStatus,
+    WorkerHealthStatus,
 )
 from app.services.export import build_batch_export_archive
+from app.services.startup_validator import validate_startup
 from app.services.storage import validate_storage_config
 from app.services.sweeper import cleanup_stale_static_files, cleanup_stale_temp_dirs
-from app.worker import process_video_task
+from app.worker import celery_app, process_video_task
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,9 @@ async def lifespan(app: FastAPI):
 
     # Validate storage configuration, writability, and URL settings at startup
     validate_storage_config()
+
+    # Pre-flight startup validation: models, executables, fonts, Redis, LLM, env vars
+    validate_startup(service_name="api", fail_fast=True, redis_client=get_redis_client())
 
     # Sweep stale temp media directories on application startup
     try:
@@ -56,13 +66,6 @@ async def lifespan(app: FastAPI):
             logger.info("Cleaned %d stale static entries on startup", len(cleaned_static))
     except Exception as e:
         logger.warning("Startup stale static cleanup failed: %s", e)
-
-    # Validate LLM configuration on startup
-    try:
-        from app.services.analyzer import validate_llm_config
-        validate_llm_config()
-    except Exception as e:
-        logger.warning("LLM configuration validation warning on startup: %s", e)
 
     yield
 
@@ -348,6 +351,132 @@ async def download_single_clip(job_id: str, clip_id: str):
     raise HTTPException(status_code=404, detail="Clip file not available")
 
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
+@app.get("/health", response_model=HealthCheckResponse)
+@app.get("/api/health", response_model=HealthCheckResponse)
+def health_check(response: Response):
+    """Detailed system health check reporting worker, queue, and Redis status."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    r = get_redis_client()
+
+    # 1. Check Redis connectivity & latency
+    redis_status = "ok"
+    redis_latency = None
+    redis_detail = None
+    try:
+        t0 = time.time()
+        r.ping()
+        redis_latency = round((time.time() - t0) * 1000.0, 2)
+    except Exception as e:
+        redis_status = "unhealthy"
+        redis_detail = str(e)
+        logger.error("Health check Redis failure: %s", e)
+
+    # 2. Check Queue depth & active jobs
+    queue_depth = 0
+    active_jobs_count = 0
+    queue_status = "ok"
+    queue_detail = None
+    if redis_status == "ok":
+        try:
+            queue_depth = int(r.llen("celery") or 0)
+            # Scan active job keys
+            job_keys = r.keys("job:*")
+            logger.info("Health check job keys: %s", job_keys)
+            for k in job_keys:
+                key_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                raw_data = r.get(key_str)
+                if raw_data:
+                    if isinstance(raw_data, bytes):
+                        raw_data = raw_data.decode("utf-8")
+                    try:
+                        parsed = json.loads(raw_data)
+                        if parsed.get("stage") in ACTIVE_PROCESSING_STAGES or parsed.get("status") in ACTIVE_PROCESSING_STAGES:
+                            active_jobs_count += 1
+                    except Exception as parse_err:
+                        logger.warning("Error parsing job status in health check: %s", parse_err)
+            if queue_depth > 100:
+                queue_status = "degraded"
+                queue_detail = f"High queue backlog: {queue_depth} tasks pending"
+        except Exception as e:
+            queue_status = "degraded"
+            queue_detail = f"Queue inspection error: {e}"
+    else:
+        queue_status = "unhealthy"
+        queue_detail = "Cannot inspect queue: Redis unreachable"
+
+    # 3. Check Celery workers
+    worker_names: list[str] = []
+    worker_status = "ok"
+    worker_detail = None
+    try:
+        ping_res = celery_app.control.ping(timeout=0.3)
+        if ping_res:
+            for item in ping_res:
+                if isinstance(item, dict):
+                    worker_names.extend(list(item.keys()))
+        active_workers = len(worker_names)
+        if active_workers == 0:
+            env_name = getattr(settings, "ENVIRONMENT", "development").lower()
+            if env_name in ("production", "staging", "prod"):
+                worker_status = "degraded"
+                worker_detail = "No active Celery workers responding to ping"
+            else:
+                worker_status = "ok"
+                worker_detail = "Development mode: workers idle or offline"
+        else:
+            worker_detail = f"{active_workers} worker(s) active"
+    except Exception as e:
+        worker_status = "degraded"
+        worker_detail = f"Worker ping inspection failed: {e}"
+        active_workers = 0
+
+    # 4. Check Storage
+    storage_status = "ok"
+    storage_detail = None
+    if settings.STORAGE_BACKEND == "local":
+        if os.path.isdir(settings.STATIC_DIR) and os.access(settings.STATIC_DIR, os.W_OK):
+            storage_detail = f"Local static directory writable ({settings.STATIC_DIR})"
+        else:
+            storage_status = "degraded"
+            storage_detail = f"Local static directory '{settings.STATIC_DIR}' missing or not writable"
+    else:
+        storage_detail = f"S3 mode ({settings.S3_BUCKET_NAME})"
+
+    # Overall system health synthesis
+    if redis_status == "unhealthy":
+        overall_status = "unhealthy"
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    elif worker_status == "degraded" or queue_status == "degraded" or storage_status == "degraded":
+        overall_status = "degraded"
+        response.status_code = status.HTTP_200_OK
+    else:
+        overall_status = "ok"
+        response.status_code = status.HTTP_200_OK
+
+    return HealthCheckResponse(
+        status=overall_status,
+        service="clipper-api",
+        environment=settings.ENVIRONMENT,
+        timestamp=now_iso,
+        redis=HealthComponentStatus(
+            status=redis_status,
+            latency_ms=redis_latency,
+            detail=redis_detail,
+        ),
+        queue=QueueHealthStatus(
+            status=queue_status,
+            depth=queue_depth,
+            active_jobs=active_jobs_count,
+            detail=queue_detail,
+        ),
+        workers=WorkerHealthStatus(
+            status=worker_status,
+            active_workers=len(worker_names),
+            worker_names=worker_names,
+            detail=worker_detail,
+        ),
+        storage=HealthComponentStatus(
+            status=storage_status,
+            detail=storage_detail,
+        ),
+    )

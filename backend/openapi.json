@@ -194,6 +194,98 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HealthCheckResponse": {
+        "description": "System health inspection reporting Redis, queue, worker, and storage readiness.",
+        "properties": {
+          "environment": {
+            "default": "development",
+            "description": "Deployment environment.",
+            "title": "Environment",
+            "type": "string"
+          },
+          "queue": {
+            "$ref": "#/components/schemas/QueueHealthStatus",
+            "description": "Celery queue depth and active jobs status."
+          },
+          "redis": {
+            "$ref": "#/components/schemas/HealthComponentStatus",
+            "description": "Redis connection and latency status."
+          },
+          "service": {
+            "default": "clipper-api",
+            "description": "Service identifier.",
+            "title": "Service",
+            "type": "string"
+          },
+          "status": {
+            "description": "Overall system status: 'ok', 'degraded', or 'unhealthy'.",
+            "title": "Status",
+            "type": "string"
+          },
+          "storage": {
+            "$ref": "#/components/schemas/HealthComponentStatus",
+            "description": "Storage backend writability status."
+          },
+          "timestamp": {
+            "description": "ISO-8601 UTC timestamp of the health check evaluation.",
+            "title": "Timestamp",
+            "type": "string"
+          },
+          "workers": {
+            "$ref": "#/components/schemas/WorkerHealthStatus",
+            "description": "Worker cluster availability and ping status."
+          }
+        },
+        "required": [
+          "status",
+          "timestamp",
+          "redis",
+          "queue",
+          "workers",
+          "storage"
+        ],
+        "title": "HealthCheckResponse",
+        "type": "object"
+      },
+      "HealthComponentStatus": {
+        "description": "Health status of an individual subsystem component.",
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Diagnostic detail or failure message.",
+            "title": "Detail"
+          },
+          "latency_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Round-trip latency in milliseconds if applicable.",
+            "title": "Latency Ms"
+          },
+          "status": {
+            "description": "Component status: 'ok', 'degraded', or 'unhealthy'.",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "HealthComponentStatus",
+        "type": "object"
+      },
       "JobCreateRequest": {
         "properties": {
           "caption_preset": {
@@ -497,6 +589,45 @@
         "title": "PipelineErrorCode",
         "type": "string"
       },
+      "QueueHealthStatus": {
+        "description": "Health status and depth metrics of the job execution queue.",
+        "properties": {
+          "active_jobs": {
+            "default": 0,
+            "description": "Number of jobs currently processing in active stages.",
+            "title": "Active Jobs",
+            "type": "integer"
+          },
+          "depth": {
+            "default": 0,
+            "description": "Number of tasks waiting in Celery queue.",
+            "title": "Depth",
+            "type": "integer"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Diagnostic detail or queue backlog note.",
+            "title": "Detail"
+          },
+          "status": {
+            "description": "Queue status: 'ok', 'degraded', or 'unhealthy'.",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "QueueHealthStatus",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -577,6 +708,47 @@
         ],
         "title": "WebcamRegion",
         "type": "object"
+      },
+      "WorkerHealthStatus": {
+        "description": "Health status and discovery metrics for background workers.",
+        "properties": {
+          "active_workers": {
+            "default": 0,
+            "description": "Count of responsive Celery worker processes.",
+            "title": "Active Workers",
+            "type": "integer"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Diagnostic detail or worker pool note.",
+            "title": "Detail"
+          },
+          "status": {
+            "description": "Worker pool status: 'ok', 'degraded', or 'unhealthy'.",
+            "title": "Status",
+            "type": "string"
+          },
+          "worker_names": {
+            "description": "Hostnames/IDs of responsive workers.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Worker Names",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "WorkerHealthStatus",
+        "type": "object"
       }
     }
   },
@@ -586,6 +758,25 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/health": {
+      "get": {
+        "description": "Detailed system health check reporting worker, queue, and Redis status.",
+        "operationId": "health_check_api_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthCheckResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Check"
+      }
+    },
     "/api/jobs": {
       "post": {
         "operationId": "create_job_api_jobs_post",
@@ -750,12 +941,15 @@
     },
     "/health": {
       "get": {
+        "description": "Detailed system health check reporting worker, queue, and Redis status.",
         "operationId": "health_check_health_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/HealthCheckResponse"
+                }
               }
             },
             "description": "Successful Response"

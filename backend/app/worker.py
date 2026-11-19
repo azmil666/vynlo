@@ -40,6 +40,7 @@ from app.services.cropper import (
     verify_yunet_model_present,
 )
 from app.services.captions import generate_ass_subtitles, render_clip_single_pass
+from app.services.startup_validator import validate_startup
 from app.services.storage import upload_clip
 from app.services.sweeper import cleanup_stale_static_files, cleanup_stale_temp_dirs
 from app.services.cache import (
@@ -86,6 +87,17 @@ def on_worker_process_init(**kwargs: Any) -> None:
         logger.info("YuNet face detection model verified at worker startup: %s", model_path)
     except Exception as e:
         logger.critical("Fatal: YuNet model missing or invalid at worker startup: %s", e)
+        raise
+
+
+@worker_ready.connect
+def on_worker_ready(**kwargs: Any) -> None:
+    """Run full pre-flight startup validation when Celery worker is ready."""
+    try:
+        validate_startup(service_name="worker", fail_fast=True, redis_client=get_redis_client())
+        logger.info("Celery worker pre-flight validation completed successfully.")
+    except Exception as e:
+        logger.critical("Fatal: Celery worker pre-flight validation failed: %s", e)
         raise
 
 _redis_client = None
