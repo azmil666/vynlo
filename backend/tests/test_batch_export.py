@@ -108,7 +108,7 @@ class TestBatchExportArchive:
         resp = test_client.get(f"/api/jobs/{job_id}/download-all")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "application/zip"
-        assert f"shorts_{job_id[:8]}.zip" in resp.headers["content-disposition"]
+        assert f"vynlo-clips_{job_id[:8]}.zip" in resp.headers["content-disposition"]
 
         with zipfile.ZipFile(io.BytesIO(resp.content), "r") as zf:
             infolist = zf.infolist()
@@ -127,7 +127,7 @@ class TestBatchExportArchive:
 
             # Verify contents
             manifest_text = zf.read("captions_and_tags.txt").decode("utf-8")
-            assert "=== CLIPPER STUDIO BATCH EXPORT: JOB job_export_local_ok ===" in manifest_text
+            assert "=== VYNLO STUDIO BATCH EXPORT: JOB job_export_local_ok ===" in manifest_text
             assert "Selection Method: llm" in manifest_text
             assert "Selection Method: heuristic (Transcript energy peak fallback)" in manifest_text
             assert "Status: AVAILABLE (Local Storage)" in manifest_text

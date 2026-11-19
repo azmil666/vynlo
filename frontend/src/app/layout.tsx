@@ -15,7 +15,7 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Clipper — YouTube to Shorts Studio",
+  title: "Vynlo — Video to Shorts Studio",
   description:
     "Monochrome minimalist studio for extracting high-retention vertical clips with speech tracking and karaoke subtitles.",
 };

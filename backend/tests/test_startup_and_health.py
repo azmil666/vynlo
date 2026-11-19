@@ -133,7 +133,7 @@ def test_health_check_healthy(test_client, fake_redis):
     data = response.json()
 
     assert data["status"] in ("ok", "degraded")
-    assert data["service"] == "clipper-api"
+    assert data["service"] == "vynlo-api"
     assert data["redis"]["status"] == "ok"
     assert data["redis"]["latency_ms"] is not None
     assert data["queue"]["depth"] == 1
@@ -160,5 +160,5 @@ def test_api_health_alias(test_client, fake_redis):
     response = test_client.get("/api/health")
     assert response.status_code == 200
     data = response.json()
-    assert data["service"] == "clipper-api"
+    assert data["service"] == "vynlo-api"
     assert data["redis"]["status"] == "ok"

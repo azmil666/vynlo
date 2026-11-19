@@ -74,7 +74,7 @@ def build_batch_export_archive(
     spooled_zip = tempfile.SpooledTemporaryFile(max_size=max_spooled_memory)
 
     manifest_lines: list[str] = [
-        f"=== CLIPPER STUDIO BATCH EXPORT: JOB {job_id} ===",
+        f"=== VYNLO STUDIO BATCH EXPORT: JOB {job_id} ===",
         f"Status: {job_status.status}",
         f"Stage: {job_status.stage}",
         f"Total Clips: {len(job_status.clips)}",

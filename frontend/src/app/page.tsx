@@ -544,7 +544,7 @@ export default function HomePage() {
               <polyline points="4,4 4,20 20,20" />
             </svg>
             <span className="font-semibold text-sm tracking-tight text-[#EDEDED]">
-              Clipper Studio
+              Vynlo Studio
             </span>
             <span className="text-[11px] font-mono text-[#888888] px-1.5 py-0.5 rounded border border-white/[0.08] bg-[#0A0A0A]">
               v0.1
@@ -1305,7 +1305,7 @@ export default function HomePage() {
               jobState.clips.some((c) => c.ok !== false && c.render_ok !== false) && (
                 <a
                   href={`${getApiBaseUrl()}/api/jobs/${jobState.job_id}/download-all`}
-                  download={`clips_${jobState.job_id}.zip`}
+                  download={`vynlo-clips_${jobState.job_id.slice(0, 8)}.zip`}
                   className="h-7 px-2.5 rounded text-xs font-mono text-[#EDEDED] bg-white/[0.08] hover:bg-white/[0.12] border border-white/[0.12] transition-colors flex items-center gap-1.5"
                 >
                   <svg
@@ -1626,7 +1626,7 @@ export default function HomePage() {
 
         {/* Minimal Footer */}
         <footer className="pt-8 border-t border-white/[0.08] flex items-center justify-between text-[11px] font-mono text-[#888888]">
-          <span>Clipper AI Studio</span>
+          <span>Vynlo Studio</span>
           <span>API · {getApiBaseUrl() || "same-origin"}</span>
         </footer>
       </div>

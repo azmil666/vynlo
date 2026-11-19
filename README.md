@@ -1,70 +1,123 @@
-# Clipper MVP — YouTube/Stream to Shorts Generator
+# Vynlo
 
-An automated AI pipeline that transforms long YouTube videos, podcasts, and streams into high-retention, 9:16 vertical shorts (YouTube Shorts, TikTok, Instagram Reels) with smart face tracking, split-screen gaming layout, and animated karaoke captions.
-
----
-
-## Architecture Overview
-
-```
-                      +-------------------+
-                      | Next.js Frontend  | (port 3000)
-                      +---------+---------+
-                                |
-                     REST API   |
-                                v
-                      +-------------------+
-                      |  FastAPI Gateway  | (port 8000)
-                      +---------+---------+
-                                |
-                     Celery     | Redis (port 6379)
-                                v
-                      +-------------------+
-                      |   Celery Worker   |
-                      +---------+---------+
-                                |
-        +-----------+-----------+-----------+-----------+
-        |           |           |           |           |
-     yt-dlp      Whisper      LLM (AI)   MediaPipe   FFmpeg
-   (Download)  (Transcribe)  (Viral Hook) (Face Crop) (Subtitles)
-```
+Automated pipeline for ingesting long-form videos and producing vertical 9:16 short clips with word-level captions, face and active-speaker tracking, and loudness normalization.
 
 ---
 
-## Quickstart Guide
+## Architecture & Pipeline
+
+```
++-----------------------------------------------------------------------+
+|                           Next.js 14 Web UI                           |
+|      (State polling, video scrubbing, clip cards, batch export)       |
++-----------------------------------+-----------------------------------+
+                                    | HTTP REST
+                                    v
++-----------------------------------------------------------------------+
+|                           FastAPI Gateway                             |
+|  (Lifespan startup validation, task dispatch, job polling, /health)   |
++------------------+--------------------------------+-------------------+
+                   |                                |
+                   v                                v
++----------------------------------+ +----------------------------------+
+|          Redis (DB 0)            | |          Redis (DB 1)            |
+|       Celery Task Broker         | |  Job Status Records (TTL: 24h)   |
+|   (Queue backlog, visibility)    | |  Versioned Caches (TTL: 7d)      |
+|                                  | |  Distributed Single-Flight Locks |
++------------------+---------------+ +----------------------------------+
+                   |
+                   v
++-----------------------------------------------------------------------+
+|                    Celery Worker & Beat Scheduler                     |
+|  (Worker pool, heartbeat updates, single-pass render, hourly sweep)   |
++------------------+--------------------------------+-------------------+
+                   |                                |
+                   v                                v
++----------------------------------+ +----------------------------------+
+|           Local Mount            | |            S3 / R2               |
+|      (/app/static, TTL: 48h)     | |      Object Storage Bucket       |
++----------------------------------+ +----------------------------------+
+```
+
+### Pipeline Stages
+
+1. **Metadata & Duration Guard**: Probes the submitted media URL using `yt-dlp` to extract duration, title, and available formats. Validates domain against `ALLOWED_VIDEO_DOMAINS` and rejects videos exceeding `MAX_VIDEO_SECONDS` (default: 1200 seconds / 20 minutes) before allocating compute resources.
+2. **Capped Media Download & FFprobe Validation**: Downloads the best video and audio stream clamped to 1080p (or 720p for long videos) into an isolated directory in `/tmp/clipper`. Runs `ffprobe` to validate stream integrity, container duration, frame rate, sample aspect ratio (SAR), and pixel format, detecting variable frame rate (VFR) sources.
+3. **Faster-Whisper Transcription & Speech Validation**: Extracts a 16 kHz mono audio track and transcribes it using `faster-whisper` (CTranslate2 backend with Silero VAD) to produce word-level timestamps. Validates speech coverage ratio and minimum word count to fail fast on silent or purely musical media.
+4. **Segment-ID LLM Analysis & Rubric Ranking**: Submits transcript segment IDs and text windows to the configured LLM (`gemini-2.5-flash` or `gpt-4o-mini`) using structured JSON schema output. Scores clips against engagement, hook strength, and flow rubrics. Deduplicates overlapping candidate spans. Automatically falls back to transcript-driven heuristic segmentation if the LLM is unreachable or blocked.
+5. **YuNet Face/Active-Speaker Tracking & Layout Framing**: Decodes video frames at 4 Hz and executes neural face detection via OpenCV YuNet (`face_detection_yunet_2023mar.onnx`). Tracks bounding boxes, computes mouth motion energy to identify the active speaker, and derives smooth camera trajectories using an exponential dead-zone filter. Supports centered speaker crops or stacked split-screen layout (screen recording top 50%, webcam bottom 50%).
+6. **Multi-Script ASS Subtitle Generation & CFR FFmpeg Render**: Generates Advanced SubStation Alpha (`.ass`) subtitle streams featuring word-by-word karaoke highlight timing, platform safe-zone margins, and fallback fonts across Latin, CJK, and Arabic scripts. Executes a single-pass FFmpeg filtergraph enforcing constant frame rate (30 fps CFR), 1080x1920 scaling, subtitle rendering, and two-pass EBU R128 audio loudness normalization (-14 LUFS integrated, -1 dBFS true peak).
+7. **Verified Upload & Per-Clip Isolation**: Renders each clip within its own isolated execution boundary. Verifies file presence and byte size on disk or via S3 `head_object` check before setting status. Successful clips are marked available even if an adjacent clip fails, preventing total job failure.
+
+---
+
+## Key Engineering Decisions
+
+- **Typed PipelineError Codes**: Exceptions raise structured `PipelineError` instances containing machine-readable `PipelineErrorCode` enums, failure stage labels, user-facing error messages, and retryable flags. Errors are never silently swallowed.
+- **Heartbeat & WORKER_LOST Recovery**: Celery workers continuously write UTC heartbeat timestamps to the Redis job record during long-running tasks. The API evaluates heartbeat age against `WORKER_HEARTBEAT_TIMEOUT_SECONDS` (300 seconds); if a worker is killed or crashes mid-render, the API transitions the job from stuck active stages to `status="failed"`, `code="WORKER_LOST"`, and `retryable=true`.
+- **Transcript-Driven Heuristic Fallback**: If the LLM provider encounters API rate limits (HTTP 429), connection timeouts, or content safety filter blocks, the pipeline automatically switches to heuristic candidate selection based on speech density, sentence boundaries, and duration targets. The resulting clips are marked with `selection_method="heuristic"` and delivered normally.
+- **Versioned Cache Keys & Single-Flight Locks**: Transcripts and LLM candidates are cached in Redis using versioned schema keys (`cache:v1:transcript:...` and `cache:v1:candidates:...`). Concurrent jobs requesting the same media URL acquire a single-flight distributed lock, allowing the first worker to compute and cache results while subsequent workers wait, avoiding redundant transcription and LLM inference costs.
+- **Two-Pass Loudness Normalization**: Audio tracks are normalized to broadcast standards (-14 LUFS, -1 dBFS true peak) using FFmpeg's `loudnorm` filter with measured dual-pass parameters, preventing audio clipping and volume jumps across clips.
+- **HTTP Range Playback & Streaming Export**: Video endpoints support HTTP Byte-Range requests for low-latency scrubbing in browsers. Batch ZIP downloads (`GET /api/jobs/{job_id}/download-all`) stream through a memory-bounded `SpooledTemporaryFile` without holding full archive payloads in application memory.
+- **Retention Sweepers & Coherent Lifetimes**: Celery Beat runs periodic sweepers enforcing a documented retention hierarchy: S3 Storage (7 days) >= Static Clip Retention (48 hours) >= Job Record TTL (24 hours) > Temp Scratch Cleanup (4 hours). When job records expire while static files remain (or vice versa), the API returns a structured `expired` status rather than dangling or broken URLs.
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Purpose |
+| :--- | :--- | :--- |
+| Frontend Web UI | Next.js 14, React 18, TypeScript, Tailwind CSS, Lucide | User interface, job submission, status polling, video preview, and clip download |
+| API Gateway | FastAPI, Uvicorn, Pydantic v2, Pydantic-Settings | REST API, request validation, startup checks, streaming ZIP exports, and health probes |
+| Asynchronous Execution | Celery, Celery Beat | Asynchronous pipeline execution, task retry handling, and scheduled retention sweepers |
+| State & Cache Store | Redis 7 (alpine) | Celery task broker (DB 0), job status records (DB 1), versioned caches, and distributed locks |
+| Ingestion & Inspection | yt-dlp, FFprobe | Video and audio extraction, cookie authentication, stream validation, and metadata parsing |
+| Speech-to-Text | faster-whisper (CTranslate2, Silero VAD) | Word-level timestamped transcription, speech validation, and language detection |
+| Face Detection & Vision | OpenCV (cv2), YuNet ONNX | 4 Hz face detection, active speaker mouth-motion tracking, and smoothed reframing |
+| Content Analysis | Google Gemini (`google-genai`), OpenAI (`openai`) | Structured JSON segment scoring, virality ranking, titles, and hashtags |
+| Video Processing | FFmpeg (libx264, aac, loudnorm, ass) | Single-pass 1080x1920 cropping, 30 fps CFR conversion, subtitle burn-in, and loudness normalization |
+| Storage Backends | Local Volume Mount, AWS S3 / Cloudflare R2 (`boto3`) | MP4 clip storage with faststart container flags and presigned or direct delivery |
+| Testing & Verification | Pytest, FakeRedis, HTTPX, Node.js test runner | Unit and integration test suites, API contract validation, soak tests, and quality evaluation harness |
+
+---
+
+## Quick Start (Local & Docker)
 
 ### 1. Configure Environment Variables
-Copy the example environment configuration into `.env` at the root of the project:
+
+Copy the example environment configuration into `.env` at the root of the repository:
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and set your LLM API Key:
+Set your LLM credentials and provider:
+
 ```env
-LLM_API_KEY=your_gemini_or_openai_api_key_here
+LLM_PROVIDER=gemini
+LLM_API_KEY=your_api_key_here
 LLM_MODEL=gemini-2.5-flash
 ```
-*(You can use `gemini-2.5-flash` or OpenAI models such as `gpt-4o-mini`)*
 
----
+### 2. Boot Backend Infrastructure
 
-### 2. Start the Backend Infrastructure (Docker)
-Ensure Docker is installed and running, then start the Redis broker, FastAPI gateway, and Celery worker:
+Start Redis, the FastAPI gateway, and the Celery worker via Docker Compose:
 
 ```bash
 docker compose up --build
 ```
 
-- **FastAPI API & Docs:** [http://localhost:8000/docs](http://localhost:8000/docs)
-- **Health Check:** [http://localhost:8000/health](http://localhost:8000/health)
-- **Redis Server:** `localhost:6379`
-- **Static Media Mount:** `http://localhost:8000/static/...`
+Verify that all services started and pass startup validation:
 
----
+```bash
+curl -s http://localhost:8000/health | jq
+```
 
-### 3. Start the Next.js Frontend
-In a new terminal window:
+Expected response status is `"ok"` with responsive Redis, active Celery workers, and writable storage.
+
+### 3. Start Frontend
+
+In a separate terminal:
 
 ```bash
 cd frontend
@@ -72,47 +125,89 @@ npm install
 npm run dev
 ```
 
-Open your browser at **[http://localhost:3000](http://localhost:3000)**.
+Open `http://localhost:3000` in your browser.
 
 ---
 
-## Features & Usage
+## Configuration
 
-1. **Enter Video URL:** Paste any public YouTube or stream URL.
-2. **Choose Layout Mode:**
-   - **Smart Face Crop (`speaker`):** Uses MediaPipe Face Detection to calculate median speaker positions and crops 9:16 vertical frames centering on the active speaker.
-   - **Split Screen (`split`):** Stacks centered screen recording (top 50%) and webcam feed (bottom 50%) for gaming and reaction streams.
-3. **Choose Max Clips:** Generate 1, 3, or 5 viral candidate shorts per run.
-4. **Choose Highlight Color:** Select subtitle karaoke highlight colors (Classic Yellow, Neon Green, Vibrant Cyan, or Hot Pink).
-5. **Live Pipeline Stepper:** Watch real-time progress through downloading, transcribing with Whisper, LLM viral hook identification, and FFmpeg rendering.
-6. **Preview & Download:** Watch generated vertical clips directly in the studio gallery and download MP4 files.
+Essential environment variables loaded by `backend/app/config.py`:
+
+| Variable | Default | Allowed Values | Description |
+| :--- | :--- | :--- | :--- |
+| `LLM_PROVIDER` | `gemini` | `gemini`, `openai` | Active AI provider for candidate segment analysis. |
+| `LLM_API_KEY` | `""` | String | API key for Gemini or OpenAI (validated on boot). |
+| `LLM_MODEL` | `gemini-2.5-flash` | String | Model identifier for virality ranking and hook scoring. |
+| `REDIS_URL` | `redis://redis:6379/0` | Redis URI | Connection string for job state, versioned caches, and distributed locks. |
+| `CELERY_BROKER_URL` | `None` | Redis URI | Celery broker connection string (defaults to `REDIS_URL` if omitted). |
+| `STORAGE_BACKEND` | `local` | `local`, `s3` | Storage destination for rendered MP4 clips. |
+| `PUBLIC_BASE_URL` | `http://localhost:8000` | Absolute URL | Base URL used to construct clip delivery links (loopback rejected in production). |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Absolute URL | Base URL consumed by the Next.js frontend to reach the FastAPI gateway. |
+
+For detailed configuration reference, S3 bucket settings, retention window relationships, and operator remediation procedures, consult [RUNBOOK.md](RUNBOOK.md).
 
 ---
 
-## Troubleshooting
+## API Reference
 
-### YouTube Bot Protection & Rate Limiting (`yt-dlp`)
-If YouTube restricts unauthenticated requests or presents bot verification:
-1. Export cookies from your browser (e.g. using the "Get cookies.txt locally" extension).
-2. Save the cookies file as `cookies.txt` in the root repository.
-3. In `.env`, set:
-   ```env
-   YTDLP_COOKIES_PATH=/app/cookies.txt
-   ```
-4. Mount the cookies file in `docker-compose.yml` under `api` and `worker`:
-   ```yaml
-   volumes:
-     - ./cookies.txt:/app/cookies.txt:ro
-   ```
-5. Re-run `docker compose up --build`.
+| Method & Route | Request Body | Response Status | Description |
+| :--- | :--- | :--- | :--- |
+| `POST /api/jobs` | `JobCreateRequest` | `202 Accepted` | Submits a media URL for clipping. Accepts `url`, `layout_mode` (`speaker` or `split`), `max_clips` (1-10), `caption_preset`, and `highlight_color`. Returns initial `JobStatusResponse` with `stage="queued"`. |
+| `GET /api/jobs/{job_id}` | None | `200 OK` / `404 Not Found` | Retrieves job progress, stage, error details, warnings, and clip list. Returns `status="expired"` if the retention window has elapsed. Detects stale worker heartbeats and marks `WORKER_LOST`. |
+| `GET /api/jobs/{job_id}/download-all` | None | `200 OK` / `410 Gone` | Streams all rendered MP4 clips and a JSON manifest as a single ZIP archive (`Content-Disposition: attachment`). Uses bounded memory spooling. |
+| `GET /api/jobs/{job_id}/clips/{clip_id}/download` | None | `200 OK` / `404 Not Found` | Downloads an individual rendered clip directly with attachment headers for cross-origin browser compatibility. |
+| `GET /health` | None | `200 OK` / `503 Unhealthy` | Deep health probe inspecting Redis ping latency, Celery queue depth, count and IDs of active workers, and storage writability. Available also at `/api/health`. |
 
-### Custom S3 / Cloudflare R2 Storage (Optional)
-By default, clips are saved to local volume storage (`/app/static`) and served over FastAPI at `http://localhost:8000/static/{job_id}/clip_{i}.mp4`.
-To use Cloudflare R2 or AWS S3, configure these in `.env`:
-```env
-S3_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
-S3_ACCESS_KEY=your_key
-S3_SECRET_KEY=your_secret
-S3_BUCKET_NAME=my-clips
-S3_PUBLIC_BASE_URL=https://pub-<hash>.r2.dev
+---
+
+## Testing & Quality Evaluation
+
+### Backend Unit & Integration Tests
+
+Run the full pytest suite:
+
+```bash
+backend/.venv/bin/pytest backend/tests/ -v
 ```
+
+Run fast unit tests excluding slow FFmpeg rendering passes:
+
+```bash
+backend/.venv/bin/pytest backend/tests/ -m "not slow"
+```
+
+### Python Bytecode Compilation
+
+Validate Python syntax across all modules and scripts:
+
+```bash
+python -m compileall backend/app backend/tests backend/scripts scripts
+```
+
+### Frontend Typecheck & Build
+
+Verify TypeScript interfaces and produce a production Next.js build:
+
+```bash
+cd frontend
+npx tsc --noEmit
+npm run build
+```
+
+### Load & Soak Testing
+
+Run concurrent synthetic jobs to verify queue throughput, peak memory usage, temporary directory cleanup, and worker loss recovery:
+
+```bash
+python backend/scripts/load_soak_test.py --concurrency 4 --total-jobs 8 --test-worker-lost --offline
+```
+
+### Pipeline Quality Evaluation Harness
+
+Run the automated quality benchmark across 8 standard video categories (single speaker, two-person podcast, screen share, gameplay with webcam, vertical source, long video, multilingual, and noisy audio) using [`scripts/eval/run_eval.py`](scripts/eval/run_eval.py) to validate duration, sentence boundary cuts, face tracking ratios, loudness bounds, and contact sheet frames:
+
+```bash
+python scripts/eval/run_eval.py --generate-missing
+```
+
+Detailed results are written to `eval_results/summary.md` and `eval_results/report.json`.

@@ -212,7 +212,7 @@
             "description": "Redis connection and latency status."
           },
           "service": {
-            "default": "clipper-api",
+            "default": "vynlo-api",
             "description": "Service identifier.",
             "title": "Service",
             "type": "string"
@@ -753,7 +753,8 @@
     }
   },
   "info": {
-    "title": "Clipper MVP API",
+    "description": "Automated long-form video to vertical short clips pipeline.",
+    "title": "Vynlo API",
     "version": "0.1.0"
   },
   "openapi": "3.1.0",

@@ -515,7 +515,7 @@ class WorkerHealthStatus(BaseModel):
 class HealthCheckResponse(BaseModel):
     """System health inspection reporting Redis, queue, worker, and storage readiness."""
     status: str = Field(description="Overall system status: 'ok', 'degraded', or 'unhealthy'.")
-    service: str = Field(default="clipper-api", description="Service identifier.")
+    service: str = Field(default="vynlo-api", description="Service identifier.")
     environment: str = Field(default="development", description="Deployment environment.")
     timestamp: str = Field(description="ISO-8601 UTC timestamp of the health check evaluation.")
     redis: HealthComponentStatus = Field(description="Redis connection and latency status.")

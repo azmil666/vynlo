@@ -32,7 +32,7 @@ def apply_s3_lifecycle_policy(
     s3_client: Any,
     bucket_name: str,
     retention_days: int = 7,
-    rule_id: str = "clipper-clip-lifecycle",
+    rule_id: str = "vynlo-clip-lifecycle",
     prefix: str = "",
 ) -> dict[str, Any]:
     """Apply an automated object expiration lifecycle rule to an S3 bucket."""
@@ -60,7 +60,7 @@ def apply_s3_lifecycle_policy(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Configure S3 lifecycle expiration policy for Clipper")
+    parser = argparse.ArgumentParser(description="Configure S3 lifecycle expiration policy for Vynlo")
     parser.add_argument("--days", type=int, default=settings.S3_RETENTION_DAYS, help="Retention period in days")
     parser.add_argument("--prefix", type=str, default="", help="Object key prefix filter (default: all objects)")
     args = parser.parse_args()

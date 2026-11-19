@@ -1,6 +1,6 @@
-# Production Runbook & Operator Guide: Clipping MVP
+# Production Runbook & Operator Guide: Vynlo
 
-This operational runbook documents the architecture, configuration parameters, failure codes, cache invalidation procedures, retention policies, health monitoring, test execution, and quality evaluation harness for the `clipping-mvp` video processing system.
+This operational runbook documents the architecture, configuration parameters, failure codes, cache invalidation procedures, retention policies, health monitoring, test execution, and quality evaluation harness for the Vynlo video processing system.
 
 ---
 
@@ -198,7 +198,7 @@ Querying `GET /health` or `GET /api/health` returns the health status of all sub
 ```json
 {
   "status": "ok",
-  "service": "clipper-api",
+  "service": "vynlo-api",
   "environment": "production",
   "timestamp": "2026-11-19T18:50:00.000000Z",
   "redis": {

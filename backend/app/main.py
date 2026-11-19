@@ -70,7 +70,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Clipper MVP API", lifespan=lifespan)
+app = FastAPI(
+    title="Vynlo API",
+    description="Automated long-form video to vertical short clips pipeline.",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -284,7 +288,7 @@ async def download_all_clips(job_id: str):
         finally:
             spooled_zip.close()
 
-    filename = f"shorts_{job_id[:8]}.zip"
+    filename = f"vynlo-clips_{job_id[:8]}.zip"
     return StreamingResponse(
         iterfile(),
         media_type="application/zip",
@@ -455,7 +459,7 @@ def health_check(response: Response):
 
     return HealthCheckResponse(
         status=overall_status,
-        service="clipper-api",
+        service="vynlo-api",
         environment=settings.ENVIRONMENT,
         timestamp=now_iso,
         redis=HealthComponentStatus(
