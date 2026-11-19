@@ -1,0 +1,708 @@
+{
+  "components": {
+    "schemas": {
+      "ClipResult": {
+        "description": "Result and metadata for an individual generated clip.",
+        "properties": {
+          "caption_font": {
+            "default": "Liberation Sans",
+            "description": "Font used for burned-in ASS captions.",
+            "title": "Caption Font",
+            "type": "string"
+          },
+          "clip_id": {
+            "description": "Unique identifier for the clip.",
+            "title": "Clip Id",
+            "type": "string"
+          },
+          "coverage": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Alias for detection_coverage.",
+            "title": "Coverage"
+          },
+          "description": {
+            "default": "",
+            "description": "Social media post description / caption.",
+            "title": "Description",
+            "type": "string"
+          },
+          "detection_coverage": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Fraction of frames where target subject/face was successfully tracked.",
+            "title": "Detection Coverage"
+          },
+          "detector": {
+            "default": "yunet",
+            "description": "Face / subject detector used during visual tracking.",
+            "title": "Detector",
+            "type": "string"
+          },
+          "duration": {
+            "description": "Duration of the clip in seconds.",
+            "title": "Duration",
+            "type": "number"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Machine-readable error code if clip failed.",
+            "title": "Error Code"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human-readable error message if clip failed.",
+            "title": "Error Message"
+          },
+          "hashtags": {
+            "description": "Relevant hashtags for discovery.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Hashtags",
+            "type": "array"
+          },
+          "is_fallback": {
+            "default": false,
+            "description": "Deprecated alias for selection_method == 'heuristic'. Kept for backwards compatibility.",
+            "title": "Is Fallback",
+            "type": "boolean"
+          },
+          "layout_used": {
+            "default": "speaker",
+            "description": "Layout style applied during vertical rendering.",
+            "enum": [
+              "speaker",
+              "split",
+              "fit_blur"
+            ],
+            "title": "Layout Used",
+            "type": "string"
+          },
+          "ok": {
+            "default": true,
+            "description": "Whether clip rendering and upload succeeded without error.",
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "render_ok": {
+            "default": true,
+            "description": "Whether rendering completed successfully.",
+            "title": "Render Ok",
+            "type": "boolean"
+          },
+          "selection_method": {
+            "default": "llm",
+            "description": "Method used to select candidate segment: 'llm' or fallback 'heuristic'.",
+            "enum": [
+              "llm",
+              "heuristic"
+            ],
+            "title": "Selection Method",
+            "type": "string"
+          },
+          "selection_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explanation or reasoning for segment selection.",
+            "title": "Selection Reason"
+          },
+          "title": {
+            "description": "Catchy title or hook generated for the clip.",
+            "title": "Title",
+            "type": "string"
+          },
+          "video_url": {
+            "default": "",
+            "description": "Public or presigned URL to access the rendered video.",
+            "title": "Video Url",
+            "type": "string"
+          },
+          "virality_score": {
+            "description": "Predicted virality score from 0 to 100.",
+            "title": "Virality Score",
+            "type": "integer"
+          },
+          "warnings": {
+            "description": "Non-fatal warnings encountered during clip processing.",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "$ref": "#/components/schemas/JobWarning"
+                }
+              ]
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "clip_id",
+          "title",
+          "virality_score",
+          "duration",
+          "video_url"
+        ],
+        "title": "ClipResult",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "JobCreateRequest": {
+        "properties": {
+          "caption_preset": {
+            "default": "clean_white",
+            "description": "Caption styling preset.",
+            "enum": [
+              "clean_white",
+              "bold_yellow",
+              "boxed",
+              "minimal"
+            ],
+            "title": "Caption Preset",
+            "type": "string"
+          },
+          "highlight_color": {
+            "default": "&H00FFFFFF",
+            "description": "ASS hex color for active karaoke word highlighting (&HAABBGGRR).",
+            "pattern": "^&H[0-9A-Fa-f]{8}$",
+            "title": "Highlight Color",
+            "type": "string"
+          },
+          "layout_mode": {
+            "default": "speaker",
+            "description": "Target video framing: speaker or split layout.",
+            "enum": [
+              "speaker",
+              "split"
+            ],
+            "title": "Layout Mode",
+            "type": "string"
+          },
+          "max_clips": {
+            "default": 3,
+            "description": "Maximum number of clips to extract (1 to 10).",
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Max Clips",
+            "type": "integer"
+          },
+          "platform_safe_zone": {
+            "default": "shorts",
+            "description": "Platform-specific safe margin layout.",
+            "enum": [
+              "shorts",
+              "reels",
+              "tiktok"
+            ],
+            "title": "Platform Safe Zone",
+            "type": "string"
+          },
+          "show_hook_banner": {
+            "default": true,
+            "description": "Whether to show the top hook title banner.",
+            "title": "Show Hook Banner",
+            "type": "boolean"
+          },
+          "url": {
+            "description": "Public media URL (e.g. YouTube, Vimeo, Twitch).",
+            "format": "uri",
+            "maxLength": 2083,
+            "minLength": 1,
+            "title": "Url",
+            "type": "string"
+          },
+          "webcam_region": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WebcamRegion"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional bounding box for webcam region in split layout."
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "JobCreateRequest",
+        "type": "object"
+      },
+      "JobErrorDetail": {
+        "description": "Structured error details for pipeline failures.",
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/PipelineErrorCode",
+            "description": "Machine-readable pipeline error code."
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Technical diagnostic detail or stack trace summary.",
+            "title": "Detail"
+          },
+          "message": {
+            "description": "Human-readable explanation of the error.",
+            "title": "Message",
+            "type": "string"
+          },
+          "retryable": {
+            "default": false,
+            "description": "Whether the job can be safely retried.",
+            "title": "Retryable",
+            "type": "boolean"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pipeline stage where the failure occurred.",
+            "title": "Stage"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "JobErrorDetail",
+        "type": "object"
+      },
+      "JobStatusResponse": {
+        "description": "Job status response representation.\n\nStatus String Mapping & Semantics:\n- \"completed\": All candidate clips rendered and uploaded successfully (all ok).\n- \"completed_with_warnings\": Partial success; at least one clip rendered/uploaded successfully,\n  but one or more candidate clips failed (some ok). Failed clips have ok=False, error_code,\n  and error_message, while successful clips are delivered.\n- \"partial\": Recognized alias for \"completed_with_warnings\".\n- \"failed\": All candidate clips failed (none ok), or an unrecoverable failure occurred before rendering.\n- \"expired\": The job or its storage retention window has elapsed.",
+        "properties": {
+          "clips": {
+            "description": "List of generated clip results and their delivery metadata.",
+            "items": {
+              "$ref": "#/components/schemas/ClipResult"
+            },
+            "title": "Clips",
+            "type": "array"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobErrorDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Detailed error information if the job failed."
+          },
+          "is_partial": {
+            "default": false,
+            "description": "Flag indicating if the job partially succeeded with warnings.",
+            "title": "Is Partial",
+            "type": "boolean"
+          },
+          "job_id": {
+            "description": "Unique identifier for the job.",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "progress": {
+            "default": 0,
+            "description": "Overall pipeline completion percentage (0-100).",
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Progress",
+            "type": "integer"
+          },
+          "stage": {
+            "default": "queued",
+            "description": "Current execution stage of the pipeline.",
+            "enum": [
+              "queued",
+              "downloading",
+              "transcribing",
+              "analyzing",
+              "rendering",
+              "completed",
+              "completed_with_warnings",
+              "partial",
+              "failed",
+              "expired"
+            ],
+            "title": "Stage",
+            "type": "string"
+          },
+          "status": {
+            "default": "queued",
+            "description": "High-level lifecycle status of the job.",
+            "enum": [
+              "queued",
+              "downloading",
+              "transcribing",
+              "analyzing",
+              "rendering",
+              "completed",
+              "completed_with_warnings",
+              "partial",
+              "failed",
+              "expired"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "ISO 8601 UTC timestamp of the last status update.",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "warnings": {
+            "description": "Non-fatal warnings recorded during pipeline execution.",
+            "items": {
+              "$ref": "#/components/schemas/JobWarning"
+            },
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "job_id",
+          "status",
+          "progress",
+          "clips"
+        ],
+        "title": "JobStatusResponse",
+        "type": "object"
+      },
+      "JobWarning": {
+        "description": "Non-fatal warning or degradation notice recorded during processing.",
+        "properties": {
+          "clip_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Zero-based index of affected clip, or None if job-level.",
+            "title": "Clip Index"
+          },
+          "code": {
+            "description": "Warning code identifier.",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "description": "Descriptive explanation of the non-fatal issue.",
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "JobWarning",
+        "type": "object"
+      },
+      "PipelineErrorCode": {
+        "enum": [
+          "INVALID_URL",
+          "VIDEO_UNAVAILABLE",
+          "VIDEO_TOO_LONG",
+          "LIVE_UNSUPPORTED",
+          "DOWNLOAD_FAILED",
+          "UNSUPPORTED_FORMAT",
+          "NO_SPEECH",
+          "TRANSCRIPTION_FAILED",
+          "LLM_UNAVAILABLE",
+          "LLM_BLOCKED",
+          "LLM_CONFIG",
+          "ANALYSIS_INVALID",
+          "NO_QUALIFYING_CLIPS",
+          "RENDER_FAILED",
+          "UPLOAD_FAILED",
+          "TIMEOUT",
+          "WORKER_LOST",
+          "EXPIRED",
+          "INTERNAL"
+        ],
+        "title": "PipelineErrorCode",
+        "type": "string"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "WebcamRegion": {
+        "description": "Normalized bounding box coordinates (0.0 to 1.0) defining a webcam region.",
+        "properties": {
+          "h": {
+            "description": "Height (0.0 to 1.0).",
+            "exclusiveMinimum": 0.0,
+            "maximum": 1.0,
+            "title": "H",
+            "type": "number"
+          },
+          "w": {
+            "description": "Width (0.0 to 1.0).",
+            "exclusiveMinimum": 0.0,
+            "maximum": 1.0,
+            "title": "W",
+            "type": "number"
+          },
+          "x": {
+            "description": "Left coordinate (0.0 to 1.0).",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "X",
+            "type": "number"
+          },
+          "y": {
+            "description": "Top coordinate (0.0 to 1.0).",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Y",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "w",
+          "h"
+        ],
+        "title": "WebcamRegion",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Clipper MVP API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/jobs": {
+      "post": {
+        "operationId": "create_job_api_jobs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Job"
+      }
+    },
+    "/api/jobs/{job_id}": {
+      "get": {
+        "operationId": "get_job_status_api_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Job Status"
+      }
+    },
+    "/api/jobs/{job_id}/download-all": {
+      "get": {
+        "description": "Bundle all generated clips and captions into a single zip archive for batch download.\n\nLow-memory, non-blocking streaming export:\n- Built into a SpooledTemporaryFile with strictly bounded memory footprint.\n- Uses ZIP_STORED for MP4 video entries and ZIP_DEFLATED for manifest.\n- Remote clips are fetched with timeouts and size limits in a threadpool without blocking the event loop.\n- Handles missing or expired files per clip with manifest notes rather than aborting.\n- Streams the zip response with Content-Disposition attachment header.",
+        "operationId": "download_all_clips_api_jobs__job_id__download_all_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download All Clips"
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Check"
+      }
+    }
+  }
+}

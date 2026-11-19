@@ -1,64 +1,15 @@
 "use client";
 
 import { useEffect, useState, useCallback, useMemo } from "react";
-
-interface JobErrorDetail {
-  code: string;
-  message: string;
-  retryable?: boolean;
-  detail?: string | null;
-}
-
-interface JobWarning {
-  code: string;
-  message: string;
-  clip_index?: number | null;
-}
-
-interface ClipResult {
-  clip_id: string;
-  title: string;
-  virality_score: number;
-  duration: number;
-  video_url: string;
-  is_fallback?: boolean;
-  description?: string;
-  hashtags?: string[];
-  selection_method?: "llm" | "heuristic";
-  selection_reason?: string;
-  layout_used?: "speaker" | "split" | "fit_blur";
-  detection_coverage?: number;
-  coverage?: number;
-  detector?: string;
-  caption_font?: string;
-  render_ok?: boolean;
-  ok?: boolean;
-  error_code?: string | null;
-  error_message?: string | null;
-  warnings?: (string | JobWarning)[];
-}
-
-interface JobStatus {
-  job_id: string;
-  status:
-    | "queued"
-    | "downloading"
-    | "transcribing"
-    | "analyzing"
-    | "rendering"
-    | "completed"
-    | "completed_with_warnings"
-    | "partial"
-    | "failed"
-    | "expired";
-  stage?: string;
-  progress: number;
-  updated_at?: string;
-  error?: string | JobErrorDetail | null;
-  warnings?: JobWarning[];
-  clips: ClipResult[];
-  is_partial?: boolean;
-}
+import type {
+  ClipResult,
+  JobErrorDetail,
+  JobStatus,
+  JobStatusResponse,
+  JobWarning,
+  PipelineErrorCode,
+  PipelineStage,
+} from "@/types/api";
 
 const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";

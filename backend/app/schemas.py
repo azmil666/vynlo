@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import traceback
 from typing import Any, Literal, Optional
-from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 from app.config import settings
 
@@ -42,11 +42,12 @@ class PipelineErrorCode(str, Enum):
 
 
 class JobErrorDetail(BaseModel):
-    code: PipelineErrorCode
-    message: str
-    retryable: bool = False
-    stage: Optional[str] = None
-    detail: Optional[str] = None
+    """Structured error details for pipeline failures."""
+    code: PipelineErrorCode = Field(description="Machine-readable pipeline error code.")
+    message: str = Field(description="Human-readable explanation of the error.")
+    retryable: bool = Field(default=False, description="Whether the job can be safely retried.")
+    stage: Optional[str] = Field(default=None, description="Pipeline stage where the failure occurred.")
+    detail: Optional[str] = Field(default=None, description="Technical diagnostic detail or stack trace summary.")
 
     def __str__(self) -> str:
         return self.message
@@ -110,31 +111,33 @@ class PipelineError(ValueError):
 
 
 class JobWarning(BaseModel):
-    code: str
-    message: str
-    clip_index: Optional[int] = None
+    """Non-fatal warning or degradation notice recorded during processing."""
+    code: str = Field(description="Warning code identifier.")
+    message: str = Field(description="Descriptive explanation of the non-fatal issue.")
+    clip_index: Optional[int] = Field(default=None, description="Zero-based index of affected clip, or None if job-level.")
 
 
 class WebcamRegion(BaseModel):
     """Normalized bounding box coordinates (0.0 to 1.0) defining a webcam region."""
-    x: float = Field(..., ge=0.0, le=1.0)
-    y: float = Field(..., ge=0.0, le=1.0)
-    w: float = Field(..., gt=0.0, le=1.0)
-    h: float = Field(..., gt=0.0, le=1.0)
+    x: float = Field(..., ge=0.0, le=1.0, description="Left coordinate (0.0 to 1.0).")
+    y: float = Field(..., ge=0.0, le=1.0, description="Top coordinate (0.0 to 1.0).")
+    w: float = Field(..., gt=0.0, le=1.0, description="Width (0.0 to 1.0).")
+    h: float = Field(..., gt=0.0, le=1.0, description="Height (0.0 to 1.0).")
 
 
 class JobCreateRequest(BaseModel):
-    url: HttpUrl
-    layout_mode: Literal["speaker", "split"] = "speaker"
-    webcam_region: Optional[WebcamRegion] = None
-    max_clips: int = Field(default=3, ge=1, le=10)
-    caption_preset: Literal["clean_white", "bold_yellow", "boxed", "minimal"] = "clean_white"
-    platform_safe_zone: Literal["shorts", "reels", "tiktok"] = "shorts"
+    url: HttpUrl = Field(description="Public media URL (e.g. YouTube, Vimeo, Twitch).")
+    layout_mode: Literal["speaker", "split"] = Field(default="speaker", description="Target video framing: speaker or split layout.")
+    webcam_region: Optional[WebcamRegion] = Field(default=None, description="Optional bounding box for webcam region in split layout.")
+    max_clips: int = Field(default=3, ge=1, le=10, description="Maximum number of clips to extract (1 to 10).")
+    caption_preset: Literal["clean_white", "bold_yellow", "boxed", "minimal"] = Field(default="clean_white", description="Caption styling preset.")
+    platform_safe_zone: Literal["shorts", "reels", "tiktok"] = Field(default="shorts", description="Platform-specific safe margin layout.")
     highlight_color: str = Field(
         default="&H00FFFFFF",
         pattern=r"^&H[0-9A-Fa-f]{8}$",
+        description="ASS hex color for active karaoke word highlighting (&HAABBGGRR).",
     )
-    show_hook_banner: bool = True
+    show_hook_banner: bool = Field(default=True, description="Whether to show the top hook title banner.")
 
     @field_validator("url")
     @classmethod
@@ -146,26 +149,33 @@ class JobCreateRequest(BaseModel):
 
 
 class ClipResult(BaseModel):
-    clip_id: str
-    title: str
-    virality_score: int
-    duration: float
-    video_url: str = ""
-    selection_method: Literal["llm", "heuristic"] = "llm"
-    selection_reason: Optional[str] = None
-    is_fallback: bool = False
-    description: str = ""
-    hashtags: list[str] = Field(default_factory=list)
-    layout_used: Literal["speaker", "split", "fit_blur"] = "speaker"
-    detection_coverage: Optional[float] = None
-    coverage: Optional[float] = None
-    detector: str = "yunet"
-    caption_font: str = "Liberation Sans"
-    render_ok: bool = True
-    ok: bool = True
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-    warnings: list[Any] = Field(default_factory=list)
+    """Result and metadata for an individual generated clip."""
+    model_config = ConfigDict(
+        json_schema_extra=lambda schema: schema.get("required", []).extend(
+            [f for f in ["video_url"] if f not in schema.get("required", [])]
+        )
+    )
+
+    clip_id: str = Field(description="Unique identifier for the clip.")
+    title: str = Field(description="Catchy title or hook generated for the clip.")
+    virality_score: int = Field(description="Predicted virality score from 0 to 100.")
+    duration: float = Field(description="Duration of the clip in seconds.")
+    video_url: str = Field(default="", description="Public or presigned URL to access the rendered video.")
+    selection_method: Literal["llm", "heuristic"] = Field(default="llm", description="Method used to select candidate segment: 'llm' or fallback 'heuristic'.")
+    selection_reason: Optional[str] = Field(default=None, description="Explanation or reasoning for segment selection.")
+    is_fallback: bool = Field(default=False, description="Deprecated alias for selection_method == 'heuristic'. Kept for backwards compatibility.")
+    description: str = Field(default="", description="Social media post description / caption.")
+    hashtags: list[str] = Field(default_factory=list, description="Relevant hashtags for discovery.")
+    layout_used: Literal["speaker", "split", "fit_blur"] = Field(default="speaker", description="Layout style applied during vertical rendering.")
+    detection_coverage: Optional[float] = Field(default=None, description="Fraction of frames where target subject/face was successfully tracked.")
+    coverage: Optional[float] = Field(default=None, description="Alias for detection_coverage.")
+    detector: str = Field(default="yunet", description="Face / subject detector used during visual tracking.")
+    caption_font: str = Field(default="Liberation Sans", description="Font used for burned-in ASS captions.")
+    render_ok: bool = Field(default=True, description="Whether rendering completed successfully.")
+    ok: bool = Field(default=True, description="Whether clip rendering and upload succeeded without error.")
+    error_code: Optional[str] = Field(default=None, description="Machine-readable error code if clip failed.")
+    error_message: Optional[str] = Field(default=None, description="Human-readable error message if clip failed.")
+    warnings: list[str | JobWarning] = Field(default_factory=list, description="Non-fatal warnings encountered during clip processing.")
 
     @model_validator(mode="before")
     @classmethod
@@ -220,17 +230,24 @@ class JobStatusResponse(BaseModel):
     - "failed": All candidate clips failed (none ok), or an unrecoverable failure occurred before rendering.
     - "expired": The job or its storage retention window has elapsed.
     """
-    job_id: str
-    status: PipelineStage = "queued"
-    stage: PipelineStage = "queued"
-    progress: int = Field(default=0, ge=0, le=100)
-    updated_at: str = Field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    model_config = ConfigDict(
+        json_schema_extra=lambda schema: schema.get("required", []).extend(
+            [f for f in ["status", "progress", "clips"] if f not in schema.get("required", [])]
+        )
     )
-    error: Optional[JobErrorDetail] = None
-    warnings: list[JobWarning] = Field(default_factory=list)
-    clips: list[ClipResult] = Field(default_factory=list)
-    is_partial: bool = False
+
+    job_id: str = Field(description="Unique identifier for the job.")
+    status: PipelineStage = Field(default="queued", description="High-level lifecycle status of the job.")
+    stage: PipelineStage = Field(default="queued", description="Current execution stage of the pipeline.")
+    progress: int = Field(default=0, ge=0, le=100, description="Overall pipeline completion percentage (0-100).")
+    updated_at: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+        description="ISO 8601 UTC timestamp of the last status update."
+    )
+    error: Optional[JobErrorDetail] = Field(default=None, description="Detailed error information if the job failed.")
+    warnings: list[JobWarning] = Field(default_factory=list, description="Non-fatal warnings recorded during pipeline execution.")
+    clips: list[ClipResult] = Field(default_factory=list, description="List of generated clip results and their delivery metadata.")
+    is_partial: bool = Field(default=False, description="Flag indicating if the job partially succeeded with warnings.")
 
     @model_validator(mode="before")
     @classmethod

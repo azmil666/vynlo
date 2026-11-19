@@ -259,17 +259,7 @@ async def download_all_clips(job_id: str):
     - Handles missing or expired files per clip with manifest notes rather than aborting.
     - Streams the zip response with Content-Disposition attachment header.
     """
-    data = get_redis_client().get(f"job:{job_id}")
-    if not data:
-        static_job_dir = os.path.join(settings.STATIC_DIR, job_id)
-        if os.path.isdir(static_job_dir):
-            raise HTTPException(
-                status_code=status.HTTP_410_GONE,
-                detail="Job record has expired and download is no longer available",
-            )
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    job_status = JobStatusResponse.model_validate_json(data)
+    job_status = get_job_status(job_id)
     if job_status.status == "expired":
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
