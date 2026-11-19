@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     FACE_EASE_DURATION_SECONDS: float = 1.0
     FACE_NEUTRAL_POSITION: float = 0.5
 
+    # Dynamic Camera Motion, Dead Zone & Keyframe Simplification
+    CROP_DEAD_ZONE_RATIO: float = 0.15
+    CROP_MAX_PAN_SPEED: float = 300.0
+    CROP_EASE_OMEGA: float = 3.0
+    CROP_SIMPLIFY_EPSILON: float = 2.0
+    CROP_MAX_KEYFRAMES: int = 40
+
     # Cache Configuration, Schema Versions & Guard Thresholds
     GLOBAL_CACHE_VERSION: str = "v1"
     TRANSCRIPT_SCHEMA_VERSION: str = "v1"

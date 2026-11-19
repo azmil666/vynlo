@@ -514,6 +514,184 @@ def fill_face_timeline(
     return clean_centers
 
 
+def douglas_peucker_keyframes(
+    points: list[tuple[float, float]],
+    epsilon: float = 2.0,
+    max_keyframes: int = 40,
+) -> list[tuple[float, float]]:
+    """Simplify 2D keyframes (t, x) using vertical distance Douglas-Peucker algorithm.
+
+    Iteratively increases epsilon if keyframe count exceeds max_keyframes to cap expression complexity.
+    """
+    if len(points) <= 2:
+        return points
+
+    def _rdp(pts: list[tuple[float, float]], eps: float) -> list[tuple[float, float]]:
+        if len(pts) <= 2:
+            return pts
+        first, last = pts[0], pts[-1]
+        dt = last[0] - first[0]
+        dx = last[1] - first[1]
+        if dt <= 1e-6:
+            return [first, last]
+
+        max_err = 0.0
+        max_idx = 0
+        for i in range(1, len(pts) - 1):
+            pt = pts[i]
+            interp_x = first[1] + (pt[0] - first[0]) / dt * dx
+            err = abs(pt[1] - interp_x)
+            if err > max_err:
+                max_err = err
+                max_idx = i
+
+        if max_err > eps:
+            left = _rdp(pts[: max_idx + 1], eps)
+            right = _rdp(pts[max_idx:], eps)
+            return left[:-1] + right
+        return [first, last]
+
+    current_eps = max(0.1, epsilon)
+    simplified = _rdp(points, current_eps)
+    while len(simplified) > max_keyframes and current_eps < 50.0:
+        current_eps *= 1.5
+        simplified = _rdp(points, current_eps)
+
+    return simplified
+
+
+def generate_smooth_camera_path(
+    sample_times: list[float],
+    clean_centers: list[float],
+    start_time: float,
+    duration: float,
+    frame_w: int,
+    crop_w: int,
+    dead_zone_ratio: Optional[float] = None,
+    max_pan_speed: Optional[float] = None,
+    omega: Optional[float] = None,
+    dt: float = 0.02,
+) -> list[tuple[float, float]]:
+    """Build a continuous, smoothed camera crop-x trajectory with dead zone and ease-in/out pan limits."""
+    max_crop_x = max(0, frame_w - crop_w)
+    dz_ratio = (
+        dead_zone_ratio
+        if dead_zone_ratio is not None
+        else getattr(settings, "CROP_DEAD_ZONE_RATIO", 0.15)
+    )
+    pan_speed = (
+        max_pan_speed
+        if max_pan_speed is not None
+        else getattr(settings, "CROP_MAX_PAN_SPEED", 300.0)
+    )
+    freq = (
+        omega
+        if omega is not None
+        else getattr(settings, "CROP_EASE_OMEGA", 3.0)
+    )
+
+    dead_zone_px = dz_ratio * crop_w
+
+    if not sample_times or not clean_centers:
+        static_x = max(0.0, min(float(max_crop_x), (frame_w - crop_w) / 2.0))
+        return [(0.0, static_x), (max(0.1, duration), static_x)]
+
+    rel_times = [float(t - start_time) for t in sample_times]
+    centers = [float(c) for c in clean_centers]
+
+    valid_pts = [(max(0.0, min(duration, rt)), c) for rt, c in zip(rel_times, centers)]
+    valid_pts.sort(key=lambda p: p[0])
+
+    deduped_r: list[float] = []
+    deduped_c: list[float] = []
+    for rt, c in valid_pts:
+        if not deduped_r or rt > deduped_r[-1] + 1e-5:
+            deduped_r.append(rt)
+            deduped_c.append(c)
+        else:
+            deduped_c[-1] = (deduped_c[-1] + c) / 2.0
+
+    if not deduped_r:
+        static_x = max(0.0, min(float(max_crop_x), (frame_w - crop_w) / 2.0))
+        return [(0.0, static_x), (max(0.1, duration), static_x)]
+
+    if deduped_r[0] > 0.0:
+        deduped_r.insert(0, 0.0)
+        deduped_c.insert(0, deduped_c[0])
+    if deduped_r[-1] < duration:
+        deduped_r.append(duration)
+        deduped_c.append(deduped_c[-1])
+
+    t_grid = np.arange(0.0, max(0.1, duration) + dt / 2.0, dt)
+    face_px_grid = np.interp(t_grid, deduped_r, [c * frame_w for c in deduped_c])
+
+    x = float(np.clip(face_px_grid[0] - crop_w / 2.0, 0.0, float(max_crop_x)))
+    v = 0.0
+    cam_x = x
+    path: list[tuple[float, float]] = []
+
+    for t_step, face_px in zip(t_grid, face_px_grid):
+        cam_center = cam_x + crop_w / 2.0
+        # Dead zone: hold still while subject center stays within safe margin
+        if face_px > cam_center + dead_zone_px:
+            x_target = face_px - dead_zone_px - crop_w / 2.0
+        elif face_px < cam_center - dead_zone_px:
+            x_target = face_px + dead_zone_px - crop_w / 2.0
+        else:
+            x_target = cam_x
+
+        x_target = float(np.clip(x_target, 0.0, float(max_crop_x)))
+
+        # Critically damped spring integration with velocity capping
+        acc = freq * freq * (x_target - x) - 2.0 * freq * v
+        v = float(np.clip(v + acc * dt, -pan_speed, pan_speed))
+        x = float(np.clip(x + v * dt, 0.0, float(max_crop_x)))
+        cam_x = x
+        path.append((float(t_step), x))
+
+    return path
+
+
+def build_piecewise_linear_crop_expr(keyframes: list[tuple[float, float]], max_crop_x: int) -> str:
+    """Emit piecewise-linear FFmpeg x expression between keyframes (time-clamped, even-pixel result)."""
+    if not keyframes:
+        static_x = max(0, max_crop_x // 2)
+        static_x -= (static_x % 2)
+        return str(static_x)
+
+    x_values = [pt[1] for pt in keyframes]
+    if len(keyframes) <= 1 or (max(x_values) - min(x_values) < 1.0):
+        static_x = int(round(x_values[0]))
+        static_x = max(0, min(max_crop_x, static_x))
+        static_x -= (static_x % 2)
+        return str(static_x)
+
+    segments: list[tuple[float, float, str]] = []
+    for i in range(len(keyframes) - 1):
+        t0, x0 = keyframes[i]
+        t1, x1 = keyframes[i + 1]
+        dt = max(1e-4, t1 - t0)
+        dx = x1 - x0
+        if abs(dx) < 0.2:
+            seg_expr = f"{x0:.1f}"
+        else:
+            slope = dx / dt
+            seg_expr = f"({x0:.1f}+{slope:.2f}*(t-{t0:.2f}))"
+        segments.append((t0, t1, seg_expr))
+
+    def _build_tree(segs: list[tuple[float, float, str]]) -> str:
+        if len(segs) == 1:
+            return segs[0][2]
+        mid = len(segs) // 2
+        t_split = segs[mid][0]
+        left = _build_tree(segs[:mid])
+        right = _build_tree(segs[mid:])
+        return f"if(lt(t,{t_split:.2f}),{left},{right})"
+
+    tree_expr = _build_tree(segments)
+    return f"2*round(clip({tree_expr},0,{max_crop_x})/2)"
+
+
 def compute_crop_filter(
     video_path: str,
     start_time: float,
@@ -591,65 +769,28 @@ def compute_crop_filter(
 
         clean_centers = fill_face_timeline(sample_times, raw_centers)
 
-        # 1.5-second rolling median filter
-        sample_hz = getattr(settings, "FACE_DETECTION_SAMPLE_HZ", 4.0)
-        half_window = max(1, int(round(1.5 * sample_hz / 2)))
-        n_samples = len(clean_centers)
-        smoothed_centers: list[float] = []
+        # Generate smooth continuous camera path with dead zone and ease-in/out pan limits
+        path = generate_smooth_camera_path(
+            sample_times=sample_times,
+            clean_centers=clean_centers,
+            start_time=start_time,
+            duration=duration,
+            frame_w=frame_w,
+            crop_w=crop_w,
+        )
 
-        for i in range(n_samples):
-            w_start = max(0, i - half_window)
-            w_end = min(n_samples, i + half_window + 1)
-            smoothed_centers.append(float(np.median(clean_centers[w_start:w_end])))
+        simplify_eps = getattr(settings, "CROP_SIMPLIFY_EPSILON", 2.0)
+        max_kf = getattr(settings, "CROP_MAX_KEYFRAMES", 40)
+        keyframes = douglas_peucker_keyframes(path, epsilon=simplify_eps, max_keyframes=max_kf)
 
-        # Segment into 1-second chunks and clamp within [0, frame_w - crop_w]
-        total_seconds = max(1, int(np.ceil(duration)))
-        raw_segments: list[tuple[float, int]] = []
+        max_crop_x = max(0, frame_w - crop_w)
+        crop_expr = build_piecewise_linear_crop_expr(keyframes, max_crop_x)
 
-        for s in range(total_seconds):
-            sample_indices = [
-                idx
-                for idx, t in enumerate(sample_times)
-                if s <= (t - start_time) < (s + 1.0)
-            ]
-            if sample_indices:
-                seg_center = float(np.median([smoothed_centers[idx] for idx in sample_indices]))
-            else:
-                nearest_idx = min(
-                    range(len(sample_times)),
-                    key=lambda idx: abs((sample_times[idx] - start_time) - (s + 0.5)),
-                )
-                seg_center = smoothed_centers[nearest_idx]
+        if crop_expr.isdigit() or (crop_expr.replace("-", "").isdigit()):
+            res_str = f"crop={crop_w}:{frame_h}:{crop_expr}:0,scale=1080:1920:flags=lanczos,setsar=1"
+        else:
+            res_str = f"crop={crop_w}:{frame_h}:x='{crop_expr}':y=0,scale=1080:1920:flags=lanczos,setsar=1"
 
-            crop_x = int(round(seg_center * frame_w - crop_w / 2.0))
-            crop_x = max(0, min(frame_w - crop_w, crop_x))
-            crop_x = crop_x - (crop_x % 2)
-            raw_segments.append((float(s + 1.0), crop_x))
-
-        # Merge consecutive identical segments
-        merged_segments: list[tuple[float, int]] = []
-        for t_cut, val in raw_segments:
-            if merged_segments and merged_segments[-1][1] == val:
-                merged_segments[-1] = (t_cut, val)
-            else:
-                merged_segments.append((t_cut, val))
-
-        if len(merged_segments) <= 1:
-            static_x = (
-                merged_segments[0][1]
-                if merged_segments
-                else max(0, (frame_w - crop_w) // 2)
-            )
-            static_x = static_x - (static_x % 2)
-            res_str = f"crop={crop_w}:{frame_h}:{static_x}:0,scale=1080:1920:flags=lanczos,setsar=1"
-            return CropFilterResult(res_str, layout_used="speaker", coverage=coverage)
-
-        # Build dynamic piecewise if(lt(t, ...), ...) expression
-        expr = str(merged_segments[-1][1])
-        for t_cutoff, val in reversed(merged_segments[:-1]):
-            expr = f"if(lt(t,{t_cutoff:.1f}),{val},{expr})"
-
-        res_str = f"crop={crop_w}:{frame_h}:x='{expr}':y=0,scale=1080:1920:flags=lanczos,setsar=1"
         return CropFilterResult(res_str, layout_used="speaker", coverage=coverage)
 
     finally:
