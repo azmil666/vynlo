@@ -1,0 +1,126 @@
+# Evaluation Harness Configuration
+# Spans 8 video categories for measurable clip quality assessment.
+# Missing media files can be generated automatically via --generate-missing.
+
+defaults:
+  sample_fps: 1
+  min_duration: 5.0
+  max_duration: 60.0
+  target_lufs: -14.0
+  lufs_tolerance: 2.0
+  max_crop_speed_px_per_sec: 320.0
+  min_face_in_frame_ratio: 0.85
+  max_black_bar_ratio: 0.15
+
+categories:
+  - id: single_speaker
+    name: "Single-Speaker Talk"
+    description: "Standard 16:9 keynote or lecture with a single prominent presenter"
+    source_path: "eval_media/single_speaker.mp4"
+    transcript_path: "eval_media/single_speaker_transcript.json"
+    language: "en"
+    has_face: true
+    expected_layout: "speaker"
+    expected_degradation: null
+    clip_slices:
+      - start: 0.5
+        end: 7.2
+        title: "Future of Computing"
+
+  - id: podcast_two_person
+    name: "Two-Person Podcast"
+    description: "Dual participant dialogue testing split-screen or speaker framing"
+    source_path: "eval_media/podcast_two_person.mp4"
+    transcript_path: "eval_media/podcast_two_person_transcript.json"
+    language: "en"
+    has_face: true
+    expected_layout: "split"
+    expected_degradation: null
+    clip_slices:
+      - start: 0.5
+        end: 8.4
+        title: "The Big Announcement"
+
+  - id: screen_share
+    name: "Screen Share / Slides"
+    description: "Technical presentation without speaker face testing full-frame fallback"
+    source_path: "eval_media/screen_share.mp4"
+    transcript_path: "eval_media/screen_share_transcript.json"
+    language: "en"
+    has_face: false
+    expected_layout: "full_frame"
+    expected_degradation: "LAYOUT_FALLBACK"
+    clip_slices:
+      - start: 0.5
+        end: 7.7
+        title: "System Latency Drop"
+
+  - id: gameplay_webcam
+    name: "Gameplay with Webcam"
+    description: "Game stream with picture-in-picture webcam in the corner"
+    source_path: "eval_media/gameplay_webcam.mp4"
+    transcript_path: "eval_media/gameplay_webcam_transcript.json"
+    language: "en"
+    has_face: true
+    expected_layout: "speaker"
+    expected_degradation: null
+    clip_slices:
+      - start: 0.5
+        end: 6.8
+        title: "Flanking the Enemy"
+
+  - id: vertical_source
+    name: "Vertical Source"
+    description: "Native 9:16 vertical video avoiding redundant horizontal crops"
+    source_path: "eval_media/vertical_source.mp4"
+    transcript_path: "eval_media/vertical_source_transcript.json"
+    language: "en"
+    has_face: true
+    expected_layout: "full_frame"
+    expected_degradation: null
+    clip_slices:
+      - start: 0.5
+        end: 7.6
+        title: "Vertical Video Tip"
+
+  - id: long_video
+    name: "Long Video (60+ min)"
+    description: "Extended stream testing stage memory and duration constraints"
+    source_path: "eval_media/long_video.mp4"
+    transcript_path: "eval_media/long_video_transcript.json"
+    language: "en"
+    has_face: true
+    expected_layout: "speaker"
+    expected_degradation: null
+    clip_slices:
+      - start: 0.5
+        end: 6.4
+        title: "System Stability"
+
+  - id: multilingual
+    name: "Non-English Content"
+    description: "Spanish/multilingual speech testing font rendering and word alignment"
+    source_path: "eval_media/multilingual.mp4"
+    transcript_path: "eval_media/multilingual_transcript.json"
+    language: "es"
+    has_face: true
+    expected_layout: "speaker"
+    expected_degradation: null
+    clip_slices:
+      - start: 0.5
+        end: 7.9
+        title: "Conferencia Internacional"
+
+  - id: noisy_music
+    name: "Noisy Audio / Music"
+    description: "Speech with ambient background noise testing EBU R128 loudnorm"
+    source_path: "eval_media/noisy_music.mp4"
+    transcript_path: "eval_media/noisy_music_transcript.json"
+    language: "en"
+    has_face: true
+    expected_layout: "speaker"
+    expected_degradation: null
+    clip_slices:
+      - start: 0.5
+        end: 5.7
+        title: "Audio Normalization"

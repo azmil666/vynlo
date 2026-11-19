@@ -5,6 +5,8 @@
 
 # Temporary media and render outputs
 temp_media/
+eval_media/
+eval_results/
 backend/static/*
 !backend/static/.gitkeep
 *.mp4
