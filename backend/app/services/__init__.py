@@ -25,7 +25,18 @@ from app.services.cache import (
     set_cached_transcript,
     wait_for_single_flight_completion,
 )
-from app.services.captions import burn_subtitles, generate_ass_subtitles, render_clip_single_pass
+from app.services.captions import (
+    burn_subtitles,
+    check_missing_glyphs,
+    detect_script,
+    filter_and_trim_words,
+    generate_ass_subtitles,
+    group_words_into_captions,
+    is_valid_hook_title,
+    render_clip_single_pass,
+    sanitize_ass_text,
+    verify_font_rendering,
+)
 from app.services.cropper import (
     CropFilterResult,
     DetectedFace,
@@ -131,6 +142,13 @@ __all__ = [
     "generate_ass_subtitles",
     "burn_subtitles",
     "render_clip_single_pass",
+    "check_missing_glyphs",
+    "detect_script",
+    "filter_and_trim_words",
+    "group_words_into_captions",
+    "is_valid_hook_title",
+    "sanitize_ass_text",
+    "verify_font_rendering",
     "upload_clip",
     "find_webcam_region",
     "compute_split_pane_boxes",

@@ -444,6 +444,8 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 highlight_color=options.get("highlight_color", "&H00FFFFFF"),
                 hook_title=clip.get("title"),
                 show_hook_banner=options.get("show_hook_banner", True),
+                layout=actual_layout,
+                warnings=warnings_list,
             )
             render_clip_single_pass(
                 video_path=video_path,
