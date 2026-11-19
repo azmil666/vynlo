@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import type {
   ClipResult,
   JobErrorDetail,
@@ -10,9 +10,16 @@ import type {
   PipelineErrorCode,
   PipelineStage,
 } from "@/types/api";
-
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import {
+  calculatePollingBackoff,
+  getApiBaseUrl,
+  getStoredJobId,
+  getStructuredError,
+  isJobStalled,
+  isTerminalStatus,
+  resolveVideoUrl,
+  setStoredJobId,
+} from "@/lib/jobPolling";
 
 const HIGHLIGHT_COLORS = [
   { label: "Yellow", value: "&H0000FFFF", hex: "#FFFF00" },
@@ -29,14 +36,6 @@ const ORDERED_STAGES = [
   { key: "rendering", label: "Cropping & rendering 9:16" },
   { key: "completed", label: "Pipeline completed" },
 ] as const;
-
-function resolveVideoUrl(rawUrl: string): string {
-  if (!rawUrl) return "";
-  if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
-    return rawUrl;
-  }
-  return `${API_BASE_URL.replace(/\/$/, "")}/${rawUrl.replace(/^\//, "")}`;
-}
 
 function Kbd({ children }: { children: React.ReactNode }) {
   return (
@@ -146,6 +145,17 @@ export default function HomePage() {
 
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [jobState, setJobState] = useState<JobStatus | null>(null);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
+  const [lastSubmittedOptions, setLastSubmittedOptions] = useState<{
+    url: string;
+    layout_mode: "speaker" | "split";
+    max_clips: number;
+    caption_preset: "clean_white" | "bold_yellow" | "boxed" | "minimal";
+    platform_safe_zone: "shorts" | "reels" | "tiktok";
+    highlight_color: string;
+    show_hook_banner: boolean;
+  } | null>(null);
 
   const [isMac, setIsMac] = useState(false);
   const [copiedKeys, setCopiedKeys] = useState<Record<string, boolean>>({});
@@ -157,12 +167,21 @@ export default function HomePage() {
     }
   }, []);
 
+  // Restore job from URL query parameter (?job=...) or localStorage on mount
+  useEffect(() => {
+    const stored = getStoredJobId();
+    if (stored) {
+      setCurrentJobId(stored);
+      setStoredJobId(stored);
+    }
+  }, []);
+
   // Check backend health on mount
   useEffect(() => {
     let isMounted = true;
     const checkHealth = async () => {
       try {
-        const res = await fetch(`${API_BASE_URL}/health`);
+        const res = await fetch(`${getApiBaseUrl()}/health`);
         if (isMounted) setBackendOnline(res.ok);
       } catch {
         if (isMounted) setBackendOnline(false);
@@ -174,53 +193,131 @@ export default function HomePage() {
     };
   }, []);
 
-  // Poll job status every 2500ms
+  // Poll job status with AbortController, exponential backoff, and terminal state detection
   useEffect(() => {
-    if (!currentJobId) return;
+    if (!currentJobId) {
+      setIsReconnecting(false);
+      setReconnectAttempt(0);
+      return;
+    }
 
     let isMounted = true;
-    const interval = setInterval(async () => {
+    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    let failures = 0;
+    const controller = new AbortController();
+
+    const poll = async () => {
       try {
-        const res = await fetch(`${API_BASE_URL}/api/jobs/${currentJobId}`);
+        const apiUrl = `${getApiBaseUrl()}/api/jobs/${currentJobId}`;
+        const res = await fetch(apiUrl, { signal: controller.signal });
+
         if (!res.ok) {
-          throw new Error("Failed to fetch job status");
+          if (res.status === 404) {
+            if (isMounted) {
+              setJobState({
+                job_id: currentJobId,
+                status: "failed",
+                stage: "failed",
+                progress: 0,
+                clips: [],
+                error: {
+                  code: "JOB_NOT_FOUND" as PipelineErrorCode,
+                  message:
+                    "Job not found. The job may have expired or never existed.",
+                  retryable: false,
+                },
+              });
+              setIsReconnecting(false);
+              setReconnectAttempt(0);
+            }
+            return; // Terminal state: stop polling
+          }
+
+          if (res.status === 410) {
+            const errJson = await res.json().catch(() => ({}));
+            if (isMounted) {
+              setJobState({
+                job_id: currentJobId,
+                status: "expired",
+                stage: "expired",
+                progress: 100,
+                clips: [],
+                error: {
+                  code: "EXPIRED" as PipelineErrorCode,
+                  message:
+                    errJson.detail ||
+                    "Job clips have expired and are no longer available.",
+                  retryable: false,
+                },
+              });
+              setIsReconnecting(false);
+              setReconnectAttempt(0);
+            }
+            return; // Terminal state: stop polling
+          }
+
+          throw new Error(`HTTP ${res.status}`);
         }
+
         const data: JobStatus = await res.json();
         if (isMounted) {
+          failures = 0;
+          setIsReconnecting(false);
+          setReconnectAttempt(0);
           setJobState(data);
-          if (
-            data.status === "completed" ||
-            data.status === "completed_with_warnings" ||
-            data.status === "partial" ||
-            data.status === "failed" ||
-            data.status === "expired"
-          ) {
-            clearInterval(interval);
+
+          if (isTerminalStatus(data.status)) {
+            return; // Stop polling on terminal status
           }
+
+          pollTimer = setTimeout(poll, 2500);
         }
-      } catch (err) {
-        console.error("Polling error:", err);
+      } catch (err: unknown) {
+        if (!isMounted || controller.signal.aborted) return;
+        failures += 1;
+        setIsReconnecting(true);
+        setReconnectAttempt(failures);
+        const delay = calculatePollingBackoff(failures);
+        pollTimer = setTimeout(poll, delay);
       }
-    }, 2500);
+    };
+
+    poll();
 
     return () => {
       isMounted = false;
-      clearInterval(interval);
+      controller.abort();
+      if (pollTimer) clearTimeout(pollTimer);
     };
   }, [currentJobId]);
 
   const handleSubmit = useCallback(
-    async (e?: React.FormEvent) => {
+    async (
+      e?: React.FormEvent,
+      overrideOptions?: {
+        url: string;
+        layout_mode: "speaker" | "split";
+        max_clips: number;
+        caption_preset: "clean_white" | "bold_yellow" | "boxed" | "minimal";
+        platform_safe_zone: "shorts" | "reels" | "tiktok";
+        highlight_color: string;
+        show_hook_banner: boolean;
+      }
+    ) => {
       if (e) e.preventDefault();
-      if (!url.trim() || isSubmitting) return;
-      if (
-        jobState &&
-        jobState.status !== "completed" &&
-        jobState.status !== "completed_with_warnings" &&
-        jobState.status !== "partial" &&
-        jobState.status !== "failed" &&
-        jobState.status !== "expired"
-      ) {
+      const targetOptions = overrideOptions || {
+        url: url.trim(),
+        layout_mode: layoutMode,
+        max_clips: Number(maxClips),
+        caption_preset: captionPreset,
+        platform_safe_zone: platformSafeZone,
+        highlight_color:
+          captionPreset === "bold_yellow" ? highlightColor : "&H00FFFFFF",
+        show_hook_banner: showHookBanner,
+      };
+
+      if (!targetOptions.url || isSubmitting) return;
+      if (jobState && !isTerminalStatus(jobState.status)) {
         return;
       }
 
@@ -228,21 +325,26 @@ export default function HomePage() {
       setSubmitError(null);
       setJobState(null);
       setCurrentJobId(null);
+      setIsReconnecting(false);
+      setReconnectAttempt(0);
+      setLastSubmittedOptions(targetOptions);
+
+      // If overrideOptions provided (e.g. retry), sync form state
+      if (overrideOptions) {
+        setUrl(overrideOptions.url);
+        setLayoutMode(overrideOptions.layout_mode);
+        setMaxClips(overrideOptions.max_clips);
+        setCaptionPreset(overrideOptions.caption_preset);
+        setPlatformSafeZone(overrideOptions.platform_safe_zone);
+        setHighlightColor(overrideOptions.highlight_color);
+        setShowHookBanner(overrideOptions.show_hook_banner);
+      }
 
       try {
-        const res = await fetch(`${API_BASE_URL}/api/jobs`, {
+        const res = await fetch(`${getApiBaseUrl()}/api/jobs`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            url: url.trim(),
-            layout_mode: layoutMode,
-            max_clips: Number(maxClips),
-            caption_preset: captionPreset,
-            platform_safe_zone: platformSafeZone,
-            highlight_color:
-              captionPreset === "bold_yellow" ? highlightColor : "&H00FFFFFF",
-            show_hook_banner: showHookBanner,
-          }),
+          body: JSON.stringify(targetOptions),
         });
 
         if (!res.ok) {
@@ -252,6 +354,7 @@ export default function HomePage() {
 
         const initialData: JobStatus = await res.json();
         setCurrentJobId(initialData.job_id);
+        setStoredJobId(initialData.job_id);
         setJobState(initialData);
       } catch (err: unknown) {
         const msg =
@@ -276,11 +379,22 @@ export default function HomePage() {
     ]
   );
 
+  const handleRetry = useCallback(() => {
+    if (lastSubmittedOptions) {
+      handleSubmit(undefined, lastSubmittedOptions);
+    } else if (url.trim()) {
+      handleSubmit();
+    }
+  }, [handleSubmit, lastSubmittedOptions, url]);
+
   const handleReset = useCallback(() => {
     setCurrentJobId(null);
     setJobState(null);
     setUrl("");
     setSubmitError(null);
+    setIsReconnecting(false);
+    setReconnectAttempt(0);
+    setStoredJobId(null);
   }, []);
 
   const handleCopy = useCallback(async (key: string, text: string) => {
@@ -324,6 +438,8 @@ export default function HomePage() {
       jobState.status !== "failed" &&
       jobState.status !== "expired"
   );
+
+  const isStalled = useMemo(() => isJobStalled(jobState), [jobState]);
 
   const currentStageIndex = useMemo(() => {
     if (!jobState) return -1;
@@ -848,6 +964,52 @@ export default function HomePage() {
               </div>
             </div>
 
+            {/* Reconnecting Banner */}
+            {isReconnecting && isJobActive && (
+              <div className="p-2.5 rounded bg-amber-500/10 border border-amber-500/30 text-amber-300 font-mono text-xs flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+                  <span>
+                    Network connection interrupted. Reconnecting (attempt{" "}
+                    {reconnectAttempt})…
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (currentJobId) {
+                      const id = currentJobId;
+                      setCurrentJobId(null);
+                      setTimeout(() => setCurrentJobId(id), 50);
+                    }
+                  }}
+                  className="underline hover:text-amber-100 text-[11px]"
+                >
+                  Retry now
+                </button>
+              </div>
+            )}
+
+            {/* Stalled Worker Alert */}
+            {isStalled && isJobActive && (
+              <div className="p-3 rounded bg-amber-500/10 border border-amber-500/30 text-amber-300 font-mono text-xs flex items-center justify-between gap-3">
+                <div>
+                  <p className="font-semibold">Worker Stall Detected</p>
+                  <p className="text-[11px] opacity-80">
+                    No pipeline updates received for over 3 minutes. The background
+                    worker process may have been lost or stalled.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleRetry}
+                  className="h-7 px-3 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-xs font-semibold shrink-0 transition-colors"
+                >
+                  Restart Job
+                </button>
+              </div>
+            )}
+
             {/* Segmented linear progress bar */}
             <SegmentedProgressBar
               progress={jobState.progress}
@@ -869,113 +1031,193 @@ export default function HomePage() {
                   jobState.status === "failed" && currentStageIndex === idx;
 
                 return (
-                  <div
-                    key={stage.key}
-                    className="flex items-center justify-between py-1 px-1.5 rounded transition-colors"
-                  >
-                    <div className="flex items-center gap-2.5">
-                      {isCompleted ? (
-                        <span className="w-3.5 h-3.5 rounded-full bg-[#50E3C2]/10 text-[#50E3C2] flex items-center justify-center text-[10px]">
-                          ✓
-                        </span>
-                      ) : isCurrent ? (
-                        <span className="w-3.5 h-3.5 flex items-center justify-center">
-                          <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse-dot" />
-                        </span>
-                      ) : isFailed ? (
-                        <span className="w-3.5 h-3.5 rounded-full bg-[#FF4D4D]/10 text-[#FF4D4D] flex items-center justify-center text-[10px]">
-                          ✕
-                        </span>
-                      ) : (
-                        <span className="w-3.5 h-3.5 flex items-center justify-center">
-                          <span className="w-1.5 h-1.5 rounded-full border border-white/20" />
-                        </span>
-                      )}
+                  <div key={stage.key} className="space-y-1">
+                    <div className="flex items-center justify-between py-1 px-1.5 rounded transition-colors">
+                      <div className="flex items-center gap-2.5">
+                        {isCompleted ? (
+                          <span className="w-3.5 h-3.5 rounded-full bg-[#50E3C2]/10 text-[#50E3C2] flex items-center justify-center text-[10px]">
+                            ✓
+                          </span>
+                        ) : isCurrent ? (
+                          <span className="w-3.5 h-3.5 flex items-center justify-center">
+                            <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse-dot" />
+                          </span>
+                        ) : isFailed ? (
+                          <span className="w-3.5 h-3.5 rounded-full bg-[#FF4D4D]/10 text-[#FF4D4D] flex items-center justify-center text-[10px]">
+                            ✕
+                          </span>
+                        ) : (
+                          <span className="w-3.5 h-3.5 flex items-center justify-center">
+                            <span className="w-1.5 h-1.5 rounded-full border border-white/20" />
+                          </span>
+                        )}
 
-                      <span
-                        className={
-                          isCurrent
-                            ? "text-[#EDEDED] font-medium"
-                            : isCompleted
-                            ? "text-[#888888]"
-                            : isFailed
-                            ? "text-[#FF4D4D]"
-                            : "text-[#888888]/50"
-                        }
-                      >
-                        {stage.label}
+                        <span
+                          className={
+                            isCurrent
+                              ? "text-[#EDEDED] font-medium"
+                              : isCompleted
+                              ? "text-[#888888]"
+                              : isFailed
+                              ? "text-[#FF4D4D]"
+                              : "text-[#888888]/50"
+                          }
+                        >
+                          {stage.label}
+                        </span>
+                      </div>
+
+                      <span className="text-[11px] text-[#555555]">
+                        {isCompleted
+                          ? "done"
+                          : isCurrent
+                          ? "running…"
+                          : isFailed
+                          ? "failed"
+                          : "pending"}
                       </span>
                     </div>
 
-                    <span className="text-[11px] text-[#555555]">
-                      {isCompleted
-                        ? "done"
-                        : isCurrent
-                        ? "running…"
-                        : isFailed
-                        ? "failed"
-                        : "pending"}
-                    </span>
+                    {/* Per-clip rendering progress */}
+                    {stage.key === "rendering" &&
+                      isCurrent &&
+                      jobState.clips &&
+                      jobState.clips.length > 0 && (
+                        <div className="pl-6 pb-1 text-[11px] text-[#888888] flex items-center gap-2">
+                          <span className="text-[#50E3C2]">●</span>
+                          <span>
+                            Clips rendered:{" "}
+                            {
+                              jobState.clips.filter(
+                                (c) => c.ok !== false && c.render_ok !== false
+                              ).length
+                            }{" "}
+                            / {jobState.clips.length}
+                          </span>
+                        </div>
+                      )}
                   </div>
                 );
               })}
             </div>
 
-            {/* Failure Box */}
-            {jobState.status === "failed" && (
-              <div className="pt-2 space-y-3">
-                <div className="p-3 rounded bg-[#FF4D4D]/[0.05] border border-[#FF4D4D]/20 font-mono text-xs text-[#FF4D4D]">
-                  <p className="font-semibold mb-1">
-                    Execution Failure:{" "}
-                    {typeof jobState.error === "object" && jobState.error?.code ? (
-                      <span className="font-normal opacity-80">[{jobState.error.code}]</span>
-                    ) : null}
-                  </p>
-                  <p className="opacity-90">
-                    {typeof jobState.error === "object" && jobState.error !== null
-                      ? jobState.error.message
-                      : jobState.error || "An unexpected pipeline error occurred."}
-                  </p>
+            {/* Job-Level Warnings Panel */}
+            {jobState.warnings && jobState.warnings.length > 0 && (
+              <div className="p-3 rounded-lg bg-amber-500/[0.08] border border-amber-500/20 text-amber-300 font-mono text-xs space-y-1.5">
+                <div className="flex items-center gap-2 font-semibold">
+                  <span>⚠ Pipeline Notices ({jobState.warnings.length})</span>
                 </div>
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    onClick={handleReset}
-                    className="h-8 px-3 rounded text-xs font-mono text-[#888888] hover:text-[#EDEDED] border border-white/[0.08] hover:bg-[#111111] transition-colors"
-                  >
-                    Try another link
-                  </button>
-                </div>
+                <ul className="list-disc list-inside space-y-1 text-[11px] text-amber-200/90 pl-1">
+                  {jobState.warnings.map((w, idx) => (
+                    <li key={idx}>
+                      <span className="font-mono text-amber-400 font-medium">
+                        [{w.code}]
+                      </span>{" "}
+                      {w.message}
+                      {w.clip_index !== null && w.clip_index !== undefined && (
+                        <span className="opacity-75 text-[10px] ml-1">
+                          (Clip #{w.clip_index + 1})
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
 
-            {/* Expired Box */}
-            {jobState.status === "expired" && (
-              <div className="pt-2 space-y-3">
-                <div className="p-3 rounded bg-amber-500/[0.08] border border-amber-500/20 font-mono text-xs text-amber-300">
-                  <p className="font-semibold mb-1">
-                    Job Expired:{" "}
-                    {typeof jobState.error === "object" && jobState.error?.code ? (
-                      <span className="font-normal opacity-80">[{jobState.error.code}]</span>
-                    ) : null}
-                  </p>
-                  <p className="opacity-90">
-                    {typeof jobState.error === "object" && jobState.error !== null
-                      ? jobState.error.message
-                      : jobState.error || "This job and its generated clips have expired."}
-                  </p>
-                </div>
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    onClick={handleReset}
-                    className="h-8 px-3 rounded text-xs font-mono text-[#888888] hover:text-[#EDEDED] border border-white/[0.08] hover:bg-[#111111] transition-colors"
-                  >
-                    Try another link
-                  </button>
-                </div>
-              </div>
-            )}
+            {/* Failure Box with Structured Error & Try Again */}
+            {jobState.status === "failed" &&
+              (() => {
+                const structuredErr = getStructuredError(
+                  jobState.error,
+                  jobState.status
+                );
+                return (
+                  <div className="pt-2 space-y-3">
+                    <div className="p-3.5 rounded bg-[#FF4D4D]/[0.08] border border-[#FF4D4D]/30 font-mono text-xs text-[#FF4D4D] space-y-1.5">
+                      <div className="flex items-center justify-between">
+                        <p className="font-semibold text-sm">
+                          {structuredErr.title}
+                        </p>
+                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-[#FF4D4D]/20 text-[#FF4D4D] border border-[#FF4D4D]/40 font-mono">
+                          [{structuredErr.code}]
+                        </span>
+                      </div>
+                      <p className="opacity-90 font-sans text-xs">
+                        {structuredErr.message}
+                      </p>
+                      {structuredErr.detail && (
+                        <p className="font-mono text-[11px] text-[#FF4D4D]/75 pt-1 border-t border-[#FF4D4D]/20">
+                          Detail: {structuredErr.detail}
+                        </p>
+                      )}
+                    </div>
+
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={handleReset}
+                        className="h-8 px-3 rounded text-xs font-mono text-[#888888] hover:text-[#EDEDED] border border-white/[0.08] hover:bg-[#111111] transition-colors"
+                      >
+                        Try another link
+                      </button>
+
+                      {structuredErr.retryable && (
+                        <button
+                          type="button"
+                          onClick={handleRetry}
+                          className="h-8 px-4 rounded text-xs font-mono font-medium text-black bg-white hover:bg-[#E0E0E0] transition-colors"
+                        >
+                          Try Again
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
+
+            {/* Expired Box with Structured Error & Re-render Option */}
+            {jobState.status === "expired" &&
+              (() => {
+                const structuredErr = getStructuredError(
+                  jobState.error,
+                  "expired"
+                );
+                return (
+                  <div className="pt-2 space-y-3">
+                    <div className="p-3.5 rounded bg-amber-500/[0.08] border border-amber-500/20 font-mono text-xs text-amber-300 space-y-1.5">
+                      <div className="flex items-center justify-between">
+                        <p className="font-semibold text-sm">
+                          {structuredErr.title}
+                        </p>
+                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                          [{structuredErr.code}]
+                        </span>
+                      </div>
+                      <p className="opacity-90 font-sans text-xs">
+                        {structuredErr.message}
+                      </p>
+                    </div>
+
+                    <div className="flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={handleReset}
+                        className="h-8 px-3 rounded text-xs font-mono text-[#888888] hover:text-[#EDEDED] border border-white/[0.08] hover:bg-[#111111] transition-colors"
+                      >
+                        Start new job
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleRetry}
+                        className="h-8 px-4 rounded text-xs font-mono font-medium text-black bg-white hover:bg-[#E0E0E0] transition-colors"
+                      >
+                        Re-render Video
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
           </section>
         )}
 
@@ -995,7 +1237,7 @@ export default function HomePage() {
               jobState.clips &&
               jobState.clips.some((c) => c.ok !== false && c.render_ok !== false) && (
                 <a
-                  href={`${API_BASE_URL}/api/jobs/${jobState.job_id}/download-all`}
+                  href={`${getApiBaseUrl()}/api/jobs/${jobState.job_id}/download-all`}
                   download={`clips_${jobState.job_id}.zip`}
                   className="h-7 px-2.5 rounded text-xs font-mono text-[#EDEDED] bg-white/[0.08] hover:bg-white/[0.12] border border-white/[0.12] transition-colors flex items-center gap-1.5"
                 >
@@ -1204,7 +1446,7 @@ export default function HomePage() {
         {/* Minimal Footer */}
         <footer className="pt-8 border-t border-white/[0.08] flex items-center justify-between text-[11px] font-mono text-[#888888]">
           <span>Clipper AI Studio</span>
-          <span>API · {API_BASE_URL}</span>
+          <span>API · {getApiBaseUrl() || "same-origin"}</span>
         </footer>
       </div>
     </div>
