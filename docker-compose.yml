@@ -2,10 +2,14 @@ services:
   redis:
     image: redis:7-alpine
     container_name: clipper_redis
-    # Guard Redis against unbounded memory growth from cached transcripts and candidates:
-    # - maxmemory 512mb bounds memory consumption in container environments.
-    # - volatile-lru evicts keys with a TTL (transcripts, candidates, and job records) in Least Recently Used order.
-    # - Persistent operational keys without TTL are protected from eviction.
+    # Redis configuration for Broker vs Cache/State separation:
+    # - DB 0: Celery Task Broker (CELERY_BROKER_URL). Broker queue keys have NO TTL.
+    # - DB 1: Cache & Job State (REDIS_URL). Transcripts, candidates, and job states have TTLs.
+    # - volatile-lru evicts keys WITH a TTL in LRU order when memory exceeds 512mb.
+    # - Persistent broker queue keys without TTL are protected from eviction.
+    # - NOTE for multi-node production: Redis maxmemory-policy is instance-wide (not per-DB).
+    #   For dedicated production isolation, separate instances are recommended:
+    #   a non-evicting instance for broker (noeviction) and a bounded instance for cache (volatile-lru).
     command: redis-server --maxmemory 512mb --maxmemory-policy volatile-lru --save ""
     ports:
       - "6379:6379"
@@ -35,7 +39,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: clipper_worker
-    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=1
+    command: celery -A app.worker.celery_app worker --beat --loglevel=info --concurrency=1
     env_file:
       - .env
     volumes:

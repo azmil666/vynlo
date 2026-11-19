@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import redis
 
-from app.config import settings
+from app.config import settings, validate_retention_config
 from app.schemas import (
     JobCreateRequest,
     JobErrorDetail,
@@ -22,7 +22,7 @@ from app.schemas import (
     PipelineErrorCode,
 )
 from app.services.storage import validate_storage_config
-from app.services.sweeper import cleanup_stale_temp_dirs
+from app.services.sweeper import cleanup_stale_static_files, cleanup_stale_temp_dirs
 from app.worker import process_video_task
 
 logger = logging.getLogger(__name__)
@@ -33,16 +33,27 @@ os.makedirs(settings.STATIC_DIR, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Validate retention windows and documented relationships
+    validate_retention_config(settings)
+
     # Validate storage configuration, writability, and URL settings at startup
     validate_storage_config()
 
     # Sweep stale temp media directories on application startup
     try:
-        cleaned = cleanup_stale_temp_dirs()
-        if cleaned:
-            logger.info("Cleaned %d stale temp directories on startup", len(cleaned))
+        cleaned_temp = cleanup_stale_temp_dirs()
+        if cleaned_temp:
+            logger.info("Cleaned %d stale temp directories on startup", len(cleaned_temp))
     except Exception as e:
         logger.warning("Startup stale temp cleanup failed: %s", e)
+
+    # Sweep stale local static files and orphaned job directories on application startup
+    try:
+        cleaned_static = cleanup_stale_static_files(redis_client=get_redis_client())
+        if cleaned_static:
+            logger.info("Cleaned %d stale static entries on startup", len(cleaned_static))
+    except Exception as e:
+        logger.warning("Startup stale static cleanup failed: %s", e)
 
     # Validate LLM configuration on startup
     try:
@@ -105,7 +116,11 @@ def create_job(req: JobCreateRequest):
         progress=0,
         updated_at=datetime.now(timezone.utc).isoformat(),
     )
-    get_redis_client().set(f"job:{job_id}", initial_status.model_dump_json(), ex=86400)
+    get_redis_client().set(
+        f"job:{job_id}",
+        initial_status.model_dump_json(),
+        ex=settings.JOB_RECORD_TTL_SECONDS,
+    )
     process_video_task.delay(job_id, req.model_dump(mode="json"))
     return initial_status
 
@@ -124,9 +139,68 @@ def get_job_status(job_id: str):
     r = get_redis_client()
     data = r.get(f"job:{job_id}")
     if not data:
+        # Check if static files exist for this job (job record expired but files remain)
+        static_job_dir = os.path.join(settings.STATIC_DIR, job_id)
+        if os.path.isdir(static_job_dir):
+            return JobStatusResponse(
+                job_id=job_id,
+                status="expired",
+                stage="expired",
+                progress=100,
+                error=JobErrorDetail(
+                    code=PipelineErrorCode.EXPIRED,
+                    message="Job record has expired and is no longer available.",
+                    retryable=False,
+                    stage="expired",
+                    detail="The job status record has expired from cache, though static files are pending cleanup.",
+                ),
+                clips=[],
+            )
         raise HTTPException(status_code=404, detail="Job not found")
 
     job_status = JobStatusResponse.model_validate_json(data)
+
+    # Check if job is completed but clip files have expired/been deleted (record remains but files expired)
+    if job_status.status == "completed" and job_status.clips:
+        is_expired = False
+        if job_status.updated_at:
+            try:
+                raw_updated = job_status.updated_at
+                updated_dt = datetime.fromisoformat(raw_updated.replace("Z", "+00:00"))
+                if updated_dt.tzinfo is None:
+                    updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                age_seconds = (datetime.now(timezone.utc) - updated_dt).total_seconds()
+
+                # Stale by exceeding static retention window
+                if age_seconds > (settings.STATIC_RETENTION_HOURS * 3600.0):
+                    is_expired = True
+                # Stale if older than grace period (1 hour) and all files are missing from storage
+                elif age_seconds > 3600.0 and settings.STORAGE_BACKEND == "local":
+                    all_missing = True
+                    for i, clip in enumerate(job_status.clips, start=1):
+                        clip_path = os.path.join(settings.STATIC_DIR, job_id, f"clip_{i}.mp4")
+                        if os.path.exists(clip_path):
+                            all_missing = False
+                            break
+                    if all_missing:
+                        is_expired = True
+            except Exception:
+                pass
+
+        if is_expired:
+            logger.warning(
+                "Job %s record exists but static clip files have expired/been removed.", job_id
+            )
+            job_status.status = "expired"
+            job_status.stage = "expired"
+            job_status.clips = []  # Do not return dangling URLs
+            job_status.error = JobErrorDetail(
+                code=PipelineErrorCode.EXPIRED,
+                message="Clip files have expired and are no longer available.",
+                retryable=False,
+                stage="expired",
+                detail="The storage retention window for this job has elapsed.",
+            )
 
     # Detect worker crash or killed worker process via stale heartbeat
     is_active = (
@@ -164,7 +238,7 @@ def get_job_status(job_id: str):
                 job_key = f"job:{job_id}"
                 ttl = r.ttl(job_key)
                 if ttl is None or ttl <= 0:
-                    ttl = 86400
+                    ttl = settings.JOB_RECORD_TTL_SECONDS
                 r.set(job_key, job_status.model_dump_json(), ex=ttl)
         except Exception as e:
             logger.warning("Error evaluating worker heartbeat for job %s: %s", job_id, e)
@@ -177,9 +251,20 @@ def download_all_clips(job_id: str):
     """Bundle all generated clips and captions into a single zip archive for batch download."""
     data = get_redis_client().get(f"job:{job_id}")
     if not data:
+        static_job_dir = os.path.join(settings.STATIC_DIR, job_id)
+        if os.path.isdir(static_job_dir):
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="Job record has expired and download is no longer available",
+            )
         raise HTTPException(status_code=404, detail="Job not found")
 
     job_status = JobStatusResponse.model_validate_json(data)
+    if job_status.status == "expired":
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Job clips have expired and are no longer available",
+        )
     if job_status.status != "completed" or not job_status.clips:
         raise HTTPException(
             status_code=400, detail="Job is not completed or has no clips available"
@@ -239,6 +324,14 @@ def download_all_clips(job_id: str):
             )
             captions_txt_lines.append(f"Video URL: {clip.video_url}")
             captions_txt_lines.append("")
+
+        # If no video files could be read, the clips have expired from storage
+        video_files_in_zip = [f for f in zip_file.filelist if f.filename.endswith(".mp4")]
+        if not video_files_in_zip:
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail="Job clips have expired or are missing from storage",
+            )
 
         zip_file.writestr("captions_and_tags.txt", "\n".join(captions_txt_lines))
 

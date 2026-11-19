@@ -43,7 +43,8 @@ interface JobStatus {
     | "analyzing"
     | "rendering"
     | "completed"
-    | "failed";
+    | "failed"
+    | "expired";
   stage?: string;
   progress: number;
   updated_at?: string;
@@ -229,7 +230,11 @@ export default function HomePage() {
         const data: JobStatus = await res.json();
         if (isMounted) {
           setJobState(data);
-          if (data.status === "completed" || data.status === "failed") {
+          if (
+            data.status === "completed" ||
+            data.status === "failed" ||
+            data.status === "expired"
+          ) {
             clearInterval(interval);
           }
         }
@@ -956,6 +961,34 @@ export default function HomePage() {
                     {typeof jobState.error === "object" && jobState.error !== null
                       ? jobState.error.message
                       : jobState.error || "An unexpected pipeline error occurred."}
+                  </p>
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleReset}
+                    className="h-8 px-3 rounded text-xs font-mono text-[#888888] hover:text-[#EDEDED] border border-white/[0.08] hover:bg-[#111111] transition-colors"
+                  >
+                    Try another link
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Expired Box */}
+            {jobState.status === "expired" && (
+              <div className="pt-2 space-y-3">
+                <div className="p-3 rounded bg-amber-500/[0.08] border border-amber-500/20 font-mono text-xs text-amber-300">
+                  <p className="font-semibold mb-1">
+                    Job Expired:{" "}
+                    {typeof jobState.error === "object" && jobState.error?.code ? (
+                      <span className="font-normal opacity-80">[{jobState.error.code}]</span>
+                    ) : null}
+                  </p>
+                  <p className="opacity-90">
+                    {typeof jobState.error === "object" && jobState.error !== null
+                      ? jobState.error.message
+                      : jobState.error || "This job and its generated clips have expired."}
                   </p>
                 </div>
                 <div className="flex justify-end">

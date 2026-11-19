@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     REDIS_URL: str = "redis://redis:6379/0"
+    CELERY_BROKER_URL: Optional[str] = None
     # LLM Provider configuration
     LLM_PROVIDER: str = "gemini"  # "gemini" or "openai"
     LLM_API_KEY: str = ""
@@ -73,8 +74,33 @@ class Settings(BaseSettings):
     TRANSCRIPT_SCHEMA_VERSION: str = "v1"
     CANDIDATE_SCHEMA_VERSION: str = "v1"
     PROMPT_VERSION: str = "v1"
+    # Retention & Expiry Windows (Coherent Lifetime Management)
+    # 1. Job Record TTL: Redis TTL for job status state. Default 24 hours (86,400s).
+    #    User return window: users can refresh or check their job status for at least 24h.
+    JOB_RECORD_TTL_SECONDS: int = 86400  # 24 hours
+
+    # 2. Local Static Clip Retention: Time before local static clips and orphaned dirs are swept.
+    #    Relationship: Clip files MUST live at least as long as the job record (>= JOB_RECORD_TTL_SECONDS).
+    #    Default 48 hours (172,800s).
+    STATIC_RETENTION_HOURS: float = 48.0  # 48 hours
+
+    # 3. Temp Directory Retention: Scratch files in /tmp/clipper for active jobs.
+    #    Relationship: Must live at least as long as the task time limit / heartbeat timeout
+    #    so active jobs are not swept mid-render, but shorter than job/clip retention.
+    #    Default 4 hours.
+    TEMP_DIR_CLEANUP_HOURS: float = 4.0
+
+    # 4. Independent Caches: Raw transcripts and candidate LLM extractions can be reused
+    #    across different job runs for the same video URL.
+    #    Independent of job record TTL and clip file retention. Default 7 days.
     CACHE_TRANSCRIPT_TTL_SECONDS: int = 604800  # 7 days
     CACHE_CANDIDATES_TTL_SECONDS: int = 604800  # 7 days
+
+    # 5. S3 Retention & Presigned URL Expiry:
+    #    S3 presigned URLs and lifecycle must cover the job record TTL.
+    #    Default 7 days (604,800s).
+    S3_PRESIGNED_EXPIRY_SECONDS: int = 604800  # 7 days
+    S3_RETENTION_DAYS: int = 7  # 7 days
     CACHE_DURATION_TOLERANCE_SECONDS: float = 2.0  # Acceptable tolerance for duration mismatch
     CACHE_COMPRESSION_ENABLED: bool = True
     SINGLE_FLIGHT_LOCK_TTL_SECONDS: int = 300  # 5 minutes lock expiry
@@ -85,7 +111,6 @@ class Settings(BaseSettings):
     PUBLIC_BASE_URL: str = "http://localhost:8000"
     STORAGE_BACKEND: str = "local"  # "local" or "s3"
     S3_URL_STYLE: str = "public"  # "public" or "presigned"
-    S3_PRESIGNED_EXPIRY_SECONDS: int = 604800  # 7 days, consistent with retention
     ENVIRONMENT: str = "development"  # "development", "staging", "production"
     S3_ENDPOINT_URL: Optional[str] = None
     S3_ACCESS_KEY: Optional[str] = None
@@ -105,7 +130,6 @@ class Settings(BaseSettings):
     MAX_SUPPORTED_CLIPS: int = 10
     BUDGET_BUFFER_SECONDS: int = 120
     WORKER_HEARTBEAT_TIMEOUT_SECONDS: int = 300
-    TEMP_DIR_CLEANUP_HOURS: float = 4.0
 
     # Video format selection and validation thresholds
     MAX_VIDEO_HEIGHT: int = 1080
@@ -154,3 +178,55 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def validate_retention_config(cfg: Settings) -> None:
+    """Validate consistency of retention windows across jobs, static files, temp scratch, and caches.
+
+    Documented relationships:
+    1. Clip files must live at least as long as the job record:
+       STATIC_RETENTION_HOURS * 3600 >= JOB_RECORD_TTL_SECONDS
+    2. Job record must live at least as long as a user can reasonably return:
+       JOB_RECORD_TTL_SECONDS >= 3600 (at least 1 hour, default 24h)
+    3. Temp directory retention must be sufficient for active task budgets:
+       TEMP_DIR_CLEANUP_HOURS * 3600 >= task_time_limit
+    4. S3 presigned URL expiry and retention days must cover the job record TTL:
+       If STORAGE_BACKEND == "s3":
+         S3_PRESIGNED_EXPIRY_SECONDS >= JOB_RECORD_TTL_SECONDS
+         S3_RETENTION_DAYS * 86400 >= JOB_RECORD_TTL_SECONDS
+    """
+    job_ttl = cfg.JOB_RECORD_TTL_SECONDS
+    if job_ttl < 3600:
+        raise ValueError(
+            f"Invalid retention configuration: JOB_RECORD_TTL_SECONDS ({job_ttl}s) "
+            f"must be at least 3600s (1 hour) to allow user return."
+        )
+
+    static_retention_seconds = cfg.STATIC_RETENTION_HOURS * 3600.0
+    if static_retention_seconds < job_ttl:
+        raise ValueError(
+            f"Invalid retention configuration: clip files (STATIC_RETENTION_HOURS={cfg.STATIC_RETENTION_HOURS}h = "
+            f"{static_retention_seconds}s) must live at least as long as the job record "
+            f"(JOB_RECORD_TTL_SECONDS={job_ttl}s)."
+        )
+
+    temp_retention_seconds = cfg.TEMP_DIR_CLEANUP_HOURS * 3600.0
+    if temp_retention_seconds < cfg.task_time_limit:
+        raise ValueError(
+            f"Invalid retention configuration: TEMP_DIR_CLEANUP_HOURS ({cfg.TEMP_DIR_CLEANUP_HOURS}h = "
+            f"{temp_retention_seconds}s) is shorter than task_time_limit ({cfg.task_time_limit}s), "
+            f"risking deletion of active scratch files."
+        )
+
+    if cfg.STORAGE_BACKEND == "s3":
+        if cfg.S3_URL_STYLE == "presigned" and cfg.S3_PRESIGNED_EXPIRY_SECONDS < job_ttl:
+            raise ValueError(
+                f"Invalid retention configuration: S3_PRESIGNED_EXPIRY_SECONDS ({cfg.S3_PRESIGNED_EXPIRY_SECONDS}s) "
+                f"must be >= JOB_RECORD_TTL_SECONDS ({job_ttl}s) to avoid dangling presigned URLs."
+            )
+        if cfg.S3_RETENTION_DAYS * 86400 < job_ttl:
+            raise ValueError(
+                f"Invalid retention configuration: S3_RETENTION_DAYS ({cfg.S3_RETENTION_DAYS}d = "
+                f"{cfg.S3_RETENTION_DAYS * 86400}s) must be >= JOB_RECORD_TTL_SECONDS ({job_ttl}s)."
+            )
+

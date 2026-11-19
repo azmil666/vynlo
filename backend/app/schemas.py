@@ -37,6 +37,7 @@ class PipelineErrorCode(str, Enum):
     UPLOAD_FAILED = "UPLOAD_FAILED"
     TIMEOUT = "TIMEOUT"
     WORKER_LOST = "WORKER_LOST"
+    EXPIRED = "EXPIRED"
     INTERNAL = "INTERNAL"
 
 
@@ -181,7 +182,7 @@ class ClipResult(BaseModel):
 
 
 PipelineStage = Literal[
-    "queued", "downloading", "transcribing", "analyzing", "rendering", "completed", "failed"
+    "queued", "downloading", "transcribing", "analyzing", "rendering", "completed", "failed", "expired"
 ]
 
 

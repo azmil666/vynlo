@@ -34,7 +34,7 @@ from app.services.cropper import (
 )
 from app.services.captions import generate_ass_subtitles, render_clip_single_pass
 from app.services.storage import upload_clip
-from app.services.sweeper import cleanup_stale_temp_dirs
+from app.services.sweeper import cleanup_stale_static_files, cleanup_stale_temp_dirs
 from app.services.cache import (
     acquire_single_flight_lock,
     get_cached_candidates,
@@ -47,7 +47,8 @@ from app.services.cache import (
 
 logger = logging.getLogger(__name__)
 
-celery_app = Celery("clipper_worker", broker=settings.REDIS_URL, backend=settings.REDIS_URL)
+broker_url = settings.CELERY_BROKER_URL or settings.REDIS_URL
+celery_app = Celery("clipper_worker", broker=broker_url, backend=broker_url)
 
 celery_app.conf.update(
     task_serializer="json",
@@ -57,6 +58,16 @@ celery_app.conf.update(
     enable_utc=True,
     broker_transport_options={"visibility_timeout": settings.broker_visibility_timeout},
     task_reject_on_worker_lost=False,
+    beat_schedule={
+        "sweep-stale-temp-dirs-hourly": {
+            "task": "sweep_stale_temp_dirs_task",
+            "schedule": 3600.0,
+        },
+        "sweep-stale-static-files-hourly": {
+            "task": "sweep_stale_static_files_task",
+            "schedule": 3600.0,
+        },
+    },
 )
 
 
@@ -95,7 +106,13 @@ redis_client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
 @celery_app.task(name="sweep_stale_temp_dirs_task")
 def sweep_stale_temp_dirs_task() -> list[str]:
     """Celery task to clean up old temp job directories."""
-    return cleanup_stale_temp_dirs()
+    return cleanup_stale_temp_dirs(redis_client=get_redis_client())
+
+
+@celery_app.task(name="sweep_stale_static_files_task")
+def sweep_stale_static_files_task() -> list[str]:
+    """Celery task to clean up old local static files and orphaned job directories."""
+    return cleanup_stale_static_files(redis_client=get_redis_client())
 
 
 @celery_app.task(
@@ -162,7 +179,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
         j_key = f"job:{job_id}"
         ttl = r_conn.ttl(j_key)
         if ttl is None or ttl <= 0:
-            ttl = 86400
+            ttl = settings.JOB_RECORD_TTL_SECONDS
 
         current_clips: list[dict] = []
         current_error: Any = None
