@@ -23,6 +23,8 @@ services:
       - .env
     volumes:
       - ./temp_media:/tmp/clipper
+      # In local storage mode (STORAGE_BACKEND=local), api and worker must share
+      # the static directory volume so clips written by worker are accessible to api:
       - ./backend/static:/app/static
     depends_on:
       - redis
@@ -38,6 +40,7 @@ services:
       - .env
     volumes:
       - ./temp_media:/tmp/clipper
+      # Shared static directory volume matching api service for STORAGE_BACKEND=local:
       - ./backend/static:/app/static
     depends_on:
       - redis

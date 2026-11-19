@@ -21,21 +21,21 @@ from app.schemas import (
     JobStatusResponse,
     PipelineErrorCode,
 )
+from app.services.storage import validate_storage_config
 from app.services.sweeper import cleanup_stale_temp_dirs
 from app.worker import process_video_task
 
 logger = logging.getLogger(__name__)
 
-try:
-    os.makedirs(settings.STATIC_DIR, exist_ok=True)
-except OSError:
-    fallback_static = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "static"))
-    os.makedirs(fallback_static, exist_ok=True)
-    settings.STATIC_DIR = fallback_static
+# Ensure configured static directory exists for StaticFiles mount
+os.makedirs(settings.STATIC_DIR, exist_ok=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Validate storage configuration, writability, and URL settings at startup
+    validate_storage_config()
+
     # Sweep stale temp media directories on application startup
     try:
         cleaned = cleanup_stale_temp_dirs()

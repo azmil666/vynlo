@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     TEMP_DIR: str = "/tmp/clipper"
     STATIC_DIR: str = "/app/static"
     PUBLIC_BASE_URL: str = "http://localhost:8000"
+    STORAGE_BACKEND: str = "local"  # "local" or "s3"
+    S3_URL_STYLE: str = "public"  # "public" or "presigned"
+    S3_PRESIGNED_EXPIRY_SECONDS: int = 604800  # 7 days, consistent with retention
+    ENVIRONMENT: str = "development"  # "development", "staging", "production"
     S3_ENDPOINT_URL: Optional[str] = None
     S3_ACCESS_KEY: Optional[str] = None
     S3_SECRET_KEY: Optional[str] = None
