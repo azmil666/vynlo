@@ -150,7 +150,7 @@ class ClipResult(BaseModel):
     title: str
     virality_score: int
     duration: float
-    video_url: str
+    video_url: str = ""
     selection_method: Literal["llm", "heuristic"] = "llm"
     selection_reason: Optional[str] = None
     is_fallback: bool = False
@@ -162,11 +162,24 @@ class ClipResult(BaseModel):
     detector: str = "yunet"
     caption_font: str = "Liberation Sans"
     render_ok: bool = True
+    ok: bool = True
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    warnings: list[Any] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
-    def sync_selection_method_and_is_fallback(cls, data: Any) -> Any:
+    def sync_clip_fields(cls, data: Any) -> Any:
         if isinstance(data, dict):
+            # Sync ok and render_ok
+            if "ok" in data and "render_ok" not in data:
+                data["render_ok"] = bool(data["ok"])
+            elif "render_ok" in data and "ok" not in data:
+                data["ok"] = bool(data["render_ok"])
+            elif "ok" in data and "render_ok" in data:
+                data["ok"] = bool(data["ok"])
+                data["render_ok"] = bool(data["render_ok"])
+
             if "selection_method" in data and "is_fallback" not in data:
                 data["is_fallback"] = (data["selection_method"] == "heuristic")
             elif "is_fallback" in data and "selection_method" not in data:
@@ -182,11 +195,31 @@ class ClipResult(BaseModel):
 
 
 PipelineStage = Literal[
-    "queued", "downloading", "transcribing", "analyzing", "rendering", "completed", "failed", "expired"
+    "queued",
+    "downloading",
+    "transcribing",
+    "analyzing",
+    "rendering",
+    "completed",
+    "completed_with_warnings",
+    "partial",
+    "failed",
+    "expired",
 ]
 
 
 class JobStatusResponse(BaseModel):
+    """Job status response representation.
+
+    Status String Mapping & Semantics:
+    - "completed": All candidate clips rendered and uploaded successfully (all ok).
+    - "completed_with_warnings": Partial success; at least one clip rendered/uploaded successfully,
+      but one or more candidate clips failed (some ok). Failed clips have ok=False, error_code,
+      and error_message, while successful clips are delivered.
+    - "partial": Recognized alias for "completed_with_warnings".
+    - "failed": All candidate clips failed (none ok), or an unrecoverable failure occurred before rendering.
+    - "expired": The job or its storage retention window has elapsed.
+    """
     job_id: str
     status: PipelineStage = "queued"
     stage: PipelineStage = "queued"
@@ -197,6 +230,16 @@ class JobStatusResponse(BaseModel):
     error: Optional[JobErrorDetail] = None
     warnings: list[JobWarning] = Field(default_factory=list)
     clips: list[ClipResult] = Field(default_factory=list)
+    is_partial: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_partial_flag(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            status = data.get("status")
+            if status in ("completed_with_warnings", "partial"):
+                data["is_partial"] = True
+        return data
 
     @field_validator("error", mode="before")
     @classmethod

@@ -32,6 +32,10 @@ interface ClipResult {
   detector?: string;
   caption_font?: string;
   render_ok?: boolean;
+  ok?: boolean;
+  error_code?: string | null;
+  error_message?: string | null;
+  warnings?: (string | JobWarning)[];
 }
 
 interface JobStatus {
@@ -43,6 +47,8 @@ interface JobStatus {
     | "analyzing"
     | "rendering"
     | "completed"
+    | "completed_with_warnings"
+    | "partial"
     | "failed"
     | "expired";
   stage?: string;
@@ -51,6 +57,7 @@ interface JobStatus {
   error?: string | JobErrorDetail | null;
   warnings?: JobWarning[];
   clips: ClipResult[];
+  is_partial?: boolean;
 }
 
 const API_BASE_URL =
@@ -232,6 +239,8 @@ export default function HomePage() {
           setJobState(data);
           if (
             data.status === "completed" ||
+            data.status === "completed_with_warnings" ||
+            data.status === "partial" ||
             data.status === "failed" ||
             data.status === "expired"
           ) {
@@ -256,7 +265,10 @@ export default function HomePage() {
       if (
         jobState &&
         jobState.status !== "completed" &&
-        jobState.status !== "failed"
+        jobState.status !== "completed_with_warnings" &&
+        jobState.status !== "partial" &&
+        jobState.status !== "failed" &&
+        jobState.status !== "expired"
       ) {
         return;
       }
@@ -356,12 +368,21 @@ export default function HomePage() {
   const isJobActive = Boolean(
     jobState &&
       jobState.status !== "completed" &&
-      jobState.status !== "failed"
+      jobState.status !== "completed_with_warnings" &&
+      jobState.status !== "partial" &&
+      jobState.status !== "failed" &&
+      jobState.status !== "expired"
   );
 
   const currentStageIndex = useMemo(() => {
     if (!jobState) return -1;
-    if (jobState.status === "completed") return ORDERED_STAGES.length;
+    if (
+      jobState.status === "completed" ||
+      jobState.status === "completed_with_warnings" ||
+      jobState.status === "partial"
+    ) {
+      return ORDERED_STAGES.length;
+    }
     return ORDERED_STAGES.findIndex((s) => s.key === jobState.status);
   }, [jobState]);
 
@@ -887,6 +908,8 @@ export default function HomePage() {
               {ORDERED_STAGES.map((stage, idx) => {
                 const isCompleted =
                   jobState.status === "completed" ||
+                  jobState.status === "completed_with_warnings" ||
+                  jobState.status === "partial" ||
                   (currentStageIndex > idx && jobState.status !== "failed");
                 const isCurrent =
                   stage.key === jobState.status &&
@@ -1015,9 +1038,11 @@ export default function HomePage() {
               </span>
             </div>
 
-            {jobState?.status === "completed" &&
+            {(jobState?.status === "completed" ||
+              jobState?.status === "completed_with_warnings" ||
+              jobState?.status === "partial") &&
               jobState.clips &&
-              jobState.clips.length > 0 && (
+              jobState.clips.some((c) => c.ok !== false && c.render_ok !== false) && (
                 <a
                   href={`${API_BASE_URL}/api/jobs/${jobState.job_id}/download-all`}
                   download={`clips_${jobState.job_id}.zip`}
@@ -1038,6 +1063,13 @@ export default function HomePage() {
                 </a>
               )}
           </div>
+
+          {(jobState?.status === "completed_with_warnings" ||
+            jobState?.status === "partial") && (
+            <div className="p-3 rounded-lg bg-amber-500/[0.08] border border-amber-500/20 font-mono text-xs text-amber-300">
+              <span className="font-semibold">Partial Completion:</span> One or more clips failed to render or upload, but successful clips are delivered below.
+            </div>
+          )}
 
           {jobState && jobState.clips && jobState.clips.length > 0 ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -1098,15 +1130,36 @@ export default function HomePage() {
                       </div>
                     </div>
 
-                    {/* 9:16 Video Frame */}
-                    <div className="aspect-[9/16] bg-black w-full relative">
-                      <video
-                        src={resolvedUrl}
-                        controls
-                        playsInline
-                        preload="metadata"
-                        className="w-full h-full object-contain bg-black"
-                      />
+                    {/* 9:16 Video Frame / Error State */}
+                    <div className="aspect-[9/16] bg-black w-full relative flex items-center justify-center p-4">
+                      {clip.ok === false || clip.render_ok === false ? (
+                        <div className="text-center space-y-2 font-mono">
+                          <span className="w-8 h-8 rounded-full bg-[#FF4D4D]/10 text-[#FF4D4D] flex items-center justify-center mx-auto text-sm font-bold">
+                            ✕
+                          </span>
+                          <p className="text-xs text-[#FF4D4D] font-medium">
+                            Render Failed
+                          </p>
+                          {clip.error_code && (
+                            <span className="inline-block px-1.5 py-0.5 rounded text-[10px] bg-[#FF4D4D]/10 text-[#FF4D4D] border border-[#FF4D4D]/20">
+                              [{clip.error_code}]
+                            </span>
+                          )}
+                          {clip.error_message && (
+                            <p className="text-[11px] text-[#888888] line-clamp-3 font-sans">
+                              {clip.error_message}
+                            </p>
+                          )}
+                        </div>
+                      ) : (
+                        <video
+                          src={resolvedUrl}
+                          controls
+                          playsInline
+                          preload="metadata"
+                          className="w-full h-full object-contain bg-black"
+                        />
+                      )}
                     </div>
 
                     {/* Social Kit: Description & Hashtags */}
@@ -1130,49 +1183,57 @@ export default function HomePage() {
 
                     {/* Footer Action Bar */}
                     <div className="px-3 h-9 border-t border-white/[0.08] flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-1">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleCopy(`${clip.clip_id}-caption`, captionText)
-                          }
-                          title="Copy title, description, and hashtags"
-                          className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors"
-                        >
-                          {isCaptionCopied ? "Copied" : "Copy Caption"}
-                        </button>
+                      {clip.ok === false || clip.render_ok === false ? (
+                        <span className="text-[11px] font-mono text-[#FF4D4D]">
+                          Clip unavailable
+                        </span>
+                      ) : (
+                        <>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleCopy(`${clip.clip_id}-caption`, captionText)
+                              }
+                              title="Copy title, description, and hashtags"
+                              className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors"
+                            >
+                              {isCaptionCopied ? "Copied" : "Copy Caption"}
+                            </button>
 
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleCopy(`${clip.clip_id}-link`, resolvedUrl)
-                          }
-                          className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors"
-                        >
-                          {isLinkCopied ? "Copied" : "Copy Link"}
-                        </button>
-                      </div>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleCopy(`${clip.clip_id}-link`, resolvedUrl)
+                              }
+                              className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors"
+                            >
+                              {isLinkCopied ? "Copied" : "Copy Link"}
+                            </button>
+                          </div>
 
-                      <a
-                        href={resolvedUrl}
-                        download={`${clip.clip_id}.mp4`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors flex items-center gap-1"
-                      >
-                        <span>Download</span>
-                        <svg
-                          className="w-3 h-3"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.8"
-                        >
-                          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                          <polyline points="7 10 12 15 17 10" />
-                          <line x1="12" y1="15" x2="12" y2="3" />
-                        </svg>
-                      </a>
+                          <a
+                            href={resolvedUrl}
+                            download={`${clip.clip_id}.mp4`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors flex items-center gap-1"
+                          >
+                            <span>Download</span>
+                            <svg
+                              className="w-3 h-3"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.8"
+                            >
+                              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                              <polyline points="7 10 12 15 17 10" />
+                              <line x1="12" y1="15" x2="12" y2="3" />
+                            </svg>
+                          </a>
+                        </>
+                      )}
                     </div>
                   </div>
                 );

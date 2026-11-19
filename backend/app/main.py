@@ -161,7 +161,7 @@ def get_job_status(job_id: str):
     job_status = JobStatusResponse.model_validate_json(data)
 
     # Check if job is completed but clip files have expired/been deleted (record remains but files expired)
-    if job_status.status == "completed" and job_status.clips:
+    if job_status.status in ("completed", "completed_with_warnings", "partial") and job_status.clips:
         is_expired = False
         if job_status.updated_at:
             try:
@@ -265,7 +265,7 @@ def download_all_clips(job_id: str):
             status_code=status.HTTP_410_GONE,
             detail="Job clips have expired and are no longer available",
         )
-    if job_status.status != "completed" or not job_status.clips:
+    if job_status.status not in ("completed", "completed_with_warnings", "partial") or not job_status.clips:
         raise HTTPException(
             status_code=400, detail="Job is not completed or has no clips available"
         )

@@ -376,6 +376,20 @@ def process_video_task(self, job_id: str, options: dict) -> None:
         completed_clips: list[dict] = []
         total_candidates = len(candidates)
 
+        # Idempotency cache: inspect prior state if task is retrying to avoid duplicate work
+        existing_clips: dict[str, dict] = {}
+        r_conn = get_redis_client()
+        j_key = f"job:{job_id}"
+        prior_state_raw = r_conn.get(j_key)
+        if prior_state_raw:
+            try:
+                prior_data = json.loads(prior_state_raw)
+                for c in prior_data.get("clips", []):
+                    if isinstance(c, dict) and c.get("clip_id"):
+                        existing_clips[c["clip_id"]] = c
+            except Exception:
+                pass
+
         # Determine face detector name and layout
         layout_mode = options.get("layout_mode", "speaker")
         detector_obj = _get_face_detector()
@@ -389,90 +403,41 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             detector_name = "none"
 
         for i, clip in enumerate(candidates, start=1):
-            progress_step = 30 / total_candidates if total_candidates > 0 else 30
-            current_progress = int(60 + (i - 1) * progress_step)
-            update_job_state("rendering", current_progress)
-
-            ass_path = os.path.join(work_dir, f"clip_{i}.ass")
-            final_clip_path = os.path.join(work_dir, f"final_clip_{i}.mp4")
-
-            crop_filter = compute_crop_filter(
-                video_path,
-                clip["start_time"],
-                clip["end_time"],
-                mode=layout_mode,
-                source_info=source_info,
-                words=words,
-                webcam_region=options.get("webcam_region"),
-            )
-            actual_layout = getattr(crop_filter, "layout_used", layout_mode)
-            clip_coverage = getattr(crop_filter, "coverage", None)
-
-            if actual_layout != layout_mode:
-                if layout_mode == "split":
-                    fallback_code = "NO_WEBCAM_FOUND"
-                    fallback_msg = (
-                        f"Clip {i}: No stable corner webcam detected; "
-                        f"used '{actual_layout}' layout instead of requested '{layout_mode}'."
-                    )
-                else:
-                    cov_str = (
-                        f" ({clip_coverage * 100:.1f}%)"
-                        if clip_coverage is not None
-                        else ""
-                    )
-                    fallback_code = "LAYOUT_FALLBACK"
-                    fallback_msg = (
-                        f"Clip {i}: Face detection coverage{cov_str} is below threshold "
-                        f"({settings.FACE_COVERAGE_THRESHOLD * 100:.0f}%). "
-                        f"Used '{actual_layout}' layout instead of requested '{layout_mode}'."
-                    )
-                warnings_list.append(
-                    JobWarning(
-                        code=fallback_code,
-                        message=fallback_msg,
-                        clip_index=i,
-                    )
-                )
-
-            crop_warnings = getattr(crop_filter, "warnings", [])
-            for cw in crop_warnings:
-                if "NO_WEBCAM_FOUND" in cw:
-                    warn_code = "NO_WEBCAM_FOUND"
-                elif "FALLBACK_WEBCAM_GUESS" in cw:
-                    warn_code = "FALLBACK_WEBCAM_GUESS"
-                else:
-                    warn_code = "SPEAKER_TRACKING_FALLBACK"
-                warnings_list.append(
-                    JobWarning(
-                        code=warn_code,
-                        message=f"Clip {i}: {cw}",
-                        clip_index=i,
-                    )
-                )
-
-            generate_ass_subtitles(
-                words,
-                clip["start_time"],
-                clip["end_time"],
-                ass_path,
-                preset=options.get("caption_preset", "clean_white"),
-                safe_zone=options.get("platform_safe_zone", "shorts"),
-                highlight_color=options.get("highlight_color", "&H00FFFFFF"),
-                hook_title=clip.get("title"),
-                show_hook_banner=options.get("show_hook_banner", True),
-                layout=actual_layout,
+            clip_id = f"clip_{i}"
+            progress_step = 35.0 / total_candidates if total_candidates > 0 else 35.0
+            clip_start_progress = int(60 + (i - 1) * progress_step)
+            update_job_state(
+                "rendering",
+                clip_start_progress,
+                clips=completed_clips,
                 warnings=warnings_list,
             )
-            render_clip_single_pass(
-                video_path=video_path,
-                start_time=clip["start_time"],
-                end_time=clip["end_time"],
-                crop_filter=crop_filter,
-                ass_path=ass_path,
-                output_path=final_clip_path,
-            )
-            public_url = upload_clip(final_clip_path, f"{job_id}/clip_{i}.mp4")
+
+            # Idempotency check: if clip already succeeded in a prior run, reuse it
+            prior_clip = existing_clips.get(clip_id)
+            if prior_clip and (prior_clip.get("ok") or prior_clip.get("render_ok")) and prior_clip.get("video_url"):
+                can_reuse = True
+                if settings.STORAGE_BACKEND == "local":
+                    local_check = os.path.join(settings.STATIC_DIR, f"{job_id}/clip_{i}.mp4")
+                    if not os.path.exists(local_check):
+                        can_reuse = False
+
+                if can_reuse:
+                    logger.info("Clip %d (%s) already successfully processed in prior attempt; reusing.", i, clip_id)
+                    completed_clips.append(prior_clip)
+                    clip_end_progress = int(60 + i * progress_step)
+                    update_job_state(
+                        "rendering",
+                        clip_end_progress,
+                        clips=completed_clips,
+                        warnings=warnings_list,
+                    )
+                    continue
+
+            # Deterministic output paths per clip
+            ass_path = os.path.join(work_dir, f"clip_{i}.ass")
+            final_clip_path = os.path.join(work_dir, f"final_clip_{i}.mp4")
+            upload_key = f"{job_id}/clip_{i}.mp4"
 
             is_fb = bool(
                 clip.get("is_fallback", False)
@@ -480,37 +445,200 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             )
             sel_method = clip.get("selection_method", "heuristic" if is_fb else "llm")
             sel_reason = clip.get("selection_reason")
-            if is_fb:
-                warnings_list.append(
+            clip_warnings: list[str] = []
+            actual_layout = layout_mode
+            clip_coverage = None
+
+            try:
+                crop_filter = compute_crop_filter(
+                    video_path,
+                    clip["start_time"],
+                    clip["end_time"],
+                    mode=layout_mode,
+                    source_info=source_info,
+                    words=words,
+                    webcam_region=options.get("webcam_region"),
+                )
+                actual_layout = getattr(crop_filter, "layout_used", layout_mode)
+                clip_coverage = getattr(crop_filter, "coverage", None)
+
+                if actual_layout != layout_mode:
+                    if layout_mode == "split":
+                        fallback_code = "NO_WEBCAM_FOUND"
+                        fallback_msg = (
+                            f"Clip {i}: No stable corner webcam detected; "
+                            f"used '{actual_layout}' layout instead of requested '{layout_mode}'."
+                        )
+                    else:
+                        cov_str = (
+                            f" ({clip_coverage * 100:.1f}%)"
+                            if clip_coverage is not None
+                            else ""
+                        )
+                        fallback_code = "LAYOUT_FALLBACK"
+                        fallback_msg = (
+                            f"Clip {i}: Face detection coverage{cov_str} is below threshold "
+                            f"({settings.FACE_COVERAGE_THRESHOLD * 100:.0f}%). "
+                            f"Used '{actual_layout}' layout instead of requested '{layout_mode}'."
+                        )
+                    warn_obj = JobWarning(code=fallback_code, message=fallback_msg, clip_index=i)
+                    warnings_list.append(warn_obj)
+                    clip_warnings.append(f"{fallback_code}: {fallback_msg}")
+
+                crop_warnings = getattr(crop_filter, "warnings", [])
+                for cw in crop_warnings:
+                    if "NO_WEBCAM_FOUND" in cw:
+                        warn_code = "NO_WEBCAM_FOUND"
+                    elif "FALLBACK_WEBCAM_GUESS" in cw:
+                        warn_code = "FALLBACK_WEBCAM_GUESS"
+                    else:
+                        warn_code = "SPEAKER_TRACKING_FALLBACK"
+                    warn_obj = JobWarning(code=warn_code, message=f"Clip {i}: {cw}", clip_index=i)
+                    warnings_list.append(warn_obj)
+                    clip_warnings.append(f"{warn_code}: {cw}")
+
+                generate_ass_subtitles(
+                    words,
+                    clip["start_time"],
+                    clip["end_time"],
+                    ass_path,
+                    preset=options.get("caption_preset", "clean_white"),
+                    safe_zone=options.get("platform_safe_zone", "shorts"),
+                    highlight_color=options.get("highlight_color", "&H00FFFFFF"),
+                    hook_title=clip.get("title"),
+                    show_hook_banner=options.get("show_hook_banner", True),
+                    layout=actual_layout,
+                    warnings=warnings_list,
+                )
+
+                render_clip_single_pass(
+                    video_path=video_path,
+                    start_time=clip["start_time"],
+                    end_time=clip["end_time"],
+                    crop_filter=crop_filter,
+                    ass_path=ass_path,
+                    output_path=final_clip_path,
+                )
+
+                public_url = upload_clip(final_clip_path, upload_key)
+
+                if is_fb:
+                    fb_warn = JobWarning(
+                        code="HEURISTIC_FALLBACK_CLIP",
+                        message=sel_reason or f"Clip {i} generated using heuristic transcript selection.",
+                        clip_index=i,
+                    )
+                    warnings_list.append(fb_warn)
+                    clip_warnings.append(f"HEURISTIC_FALLBACK_CLIP: {fb_warn.message}")
+
+                completed_clips.append(
                     {
-                        "code": "HEURISTIC_FALLBACK_CLIP",
-                        "message": sel_reason or f"Clip {i} generated using heuristic transcript selection.",
-                        "clip_index": i,
+                        "clip_id": clip_id,
+                        "title": clip["title"],
+                        "virality_score": clip["virality_score"],
+                        "duration": round(clip["end_time"] - clip["start_time"], 2),
+                        "video_url": public_url,
+                        "is_fallback": is_fb,
+                        "selection_method": sel_method,
+                        "selection_reason": sel_reason,
+                        "description": clip.get("description", ""),
+                        "hashtags": clip.get("hashtags", []),
+                        "layout_used": actual_layout,
+                        "detection_coverage": round(clip_coverage, 3) if clip_coverage is not None else None,
+                        "coverage": round(clip_coverage, 3) if clip_coverage is not None else None,
+                        "detector": detector_name,
+                        "caption_font": "Liberation Sans",
+                        "render_ok": True,
+                        "ok": True,
+                        "error_code": None,
+                        "error_message": None,
+                        "warnings": clip_warnings,
                     }
                 )
 
-            completed_clips.append(
-                {
-                    "clip_id": f"clip_{i}",
-                    "title": clip["title"],
-                    "virality_score": clip["virality_score"],
-                    "duration": round(clip["end_time"] - clip["start_time"], 2),
-                    "video_url": public_url,
-                    "is_fallback": is_fb,
-                    "selection_method": sel_method,
-                    "selection_reason": sel_reason,
-                    "description": clip.get("description", ""),
-                    "hashtags": clip.get("hashtags", []),
-                    "layout_used": actual_layout,
-                    "detection_coverage": round(clip_coverage, 3) if clip_coverage is not None else None,
-                    "coverage": round(clip_coverage, 3) if clip_coverage is not None else None,
-                    "detector": detector_name,
-                    "caption_font": "Liberation Sans",
-                    "render_ok": True,
-                }
+            except Exception as clip_err:
+                logger.exception("Clip %d (%s) failed during render/upload: %s", i, clip_id, clip_err)
+                if isinstance(clip_err, PipelineError):
+                    clip_code = clip_err.code.value
+                    clip_msg = clip_err.user_message
+                else:
+                    mapped = map_exception_to_pipeline_error(clip_err, current_stage="rendering")
+                    clip_code = mapped.code.value
+                    clip_msg = mapped.user_message
+
+                fail_warn = JobWarning(
+                    code=clip_code,
+                    message=f"Clip {i} failed: {clip_msg}",
+                    clip_index=i,
+                )
+                warnings_list.append(fail_warn)
+                clip_warnings.append(f"{clip_code}: {clip_msg}")
+
+                completed_clips.append(
+                    {
+                        "clip_id": clip_id,
+                        "title": clip.get("title", f"Clip {i}"),
+                        "virality_score": clip.get("virality_score", 0),
+                        "duration": round(clip["end_time"] - clip["start_time"], 2) if "end_time" in clip and "start_time" in clip else 0.0,
+                        "video_url": "",
+                        "is_fallback": is_fb,
+                        "selection_method": sel_method,
+                        "selection_reason": sel_reason,
+                        "description": clip.get("description", ""),
+                        "hashtags": clip.get("hashtags", []),
+                        "layout_used": actual_layout,
+                        "detection_coverage": None,
+                        "coverage": None,
+                        "detector": detector_name,
+                        "caption_font": "Liberation Sans",
+                        "render_ok": False,
+                        "ok": False,
+                        "error_code": clip_code,
+                        "error_message": clip_msg,
+                        "warnings": clip_warnings,
+                    }
+                )
+
+            # Update progress after this clip completes
+            clip_end_progress = int(60 + i * progress_step)
+            update_job_state(
+                "rendering",
+                clip_end_progress,
+                clips=completed_clips,
+                warnings=warnings_list,
             )
 
-        update_job_state("completed", 100, clips=completed_clips, warnings=warnings_list)
+        # Determine final job completion status
+        successful_count = sum(1 for c in completed_clips if c.get("ok", False) or c.get("render_ok", False))
+        total_count = len(completed_clips)
+
+        if total_count == 0 or successful_count == 0:
+            first_err = next(
+                (c.get("error_message") for c in completed_clips if c.get("error_message")),
+                "All candidate clips failed to render or upload.",
+            )
+            first_code = next(
+                (c.get("error_code") for c in completed_clips if c.get("error_code")),
+                PipelineErrorCode.RENDER_FAILED.value,
+            )
+            fail_detail = JobErrorDetail(
+                code=first_code,
+                message=f"All {total_count} candidate clips failed to render or upload.",
+                retryable=False,
+                stage="rendering",
+                detail=first_err,
+            )
+            update_job_state("failed", 100, clips=completed_clips, error=fail_detail, warnings=warnings_list)
+        elif successful_count < total_count:
+            logger.warning(
+                "Job %s completed with warnings (partial delivery): %d/%d clips succeeded.",
+                job_id,
+                successful_count,
+                total_count,
+            )
+            update_job_state("completed_with_warnings", 100, clips=completed_clips, warnings=warnings_list)
+        else:
+            update_job_state("completed", 100, clips=completed_clips, warnings=warnings_list)
 
     except Retry:
         raise
