@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.schemas import ALLOWED_VIDEO_DOMAINS, ClipResult, JobCreateRequest, JobStatusResponse
+from app.schemas import ALLOWED_VIDEO_DOMAINS, ClipResult, JobCreateRequest, JobStatusResponse, WebcamRegion
 
 
 class TestJobCreateRequestValidation:
@@ -60,6 +60,21 @@ class TestJobCreateRequestValidation:
     def test_invalid_layout_mode(self):
         with pytest.raises(ValidationError):
             JobCreateRequest(url="https://youtube.com/watch?v=123", layout_mode="picture_in_picture")
+
+    def test_valid_webcam_region(self):
+        region = WebcamRegion(x=0.1, y=0.2, w=0.3, h=0.4)
+        req = JobCreateRequest(url="https://youtube.com/watch?v=123", webcam_region=region)
+        assert req.webcam_region is not None
+        assert req.webcam_region.x == 0.1
+        assert req.webcam_region.w == 0.3
+
+    def test_invalid_webcam_region(self):
+        with pytest.raises(ValidationError):
+            WebcamRegion(x=-0.1, y=0.2, w=0.3, h=0.4)
+        with pytest.raises(ValidationError):
+            WebcamRegion(x=0.1, y=1.2, w=0.3, h=0.4)
+        with pytest.raises(ValidationError):
+            WebcamRegion(x=0.1, y=0.2, w=0.0, h=0.4)
 
     @pytest.mark.parametrize("count", [1, 5, 10])
     def test_valid_max_clips_bounds(self, count: int):

@@ -9,11 +9,11 @@ class TestComputeCropFilterOutputStrings:
     """Characterization tests for FFmpeg crop filter string generation."""
 
     def test_split_screen_mode_returns_hardcoded_filter(self):
-        # Split mode does not open the video file and returns immediate static filter string
+        # When video file does not exist, split mode returns the 9:8 undistorted fallback filter
         filter_str = compute_crop_filter("non_existent_video.mp4", 0.0, 10.0, mode="split")
         assert filter_str == (
-            "[0:v]crop=ih*9/8:ih:(iw-ih*9/8)/2:0,scale=1080:960:flags=lanczos,setsar=1[top];"
-            "[0:v]crop=iw*0.30:ih*0.30:iw*0.70:ih*0.70,scale=1080:960:flags=lanczos,setsar=1[bottom];"
+            "[0:v]crop=min(iw\\,ih*9/8):min(ih\\,iw*8/9):0:0,scale=1080:960:flags=lanczos,setsar=1[top];"
+            "[0:v]crop=ih*0.36*9/8:ih*0.36:iw-ih*0.36*9/8:ih-ih*0.36,scale=1080:960:flags=lanczos,setsar=1[bottom];"
             "[top][bottom]vstack=inputs=2[v]"
         )
 

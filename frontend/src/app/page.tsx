@@ -548,7 +548,7 @@ export default function HomePage() {
                 <p className="text-xs text-[#666666] font-mono">
                   {layoutMode === "speaker"
                     ? "Tracks speaker face dynamically across 9:16 full-screen frame."
-                    : "Stacks gameplay center-crop (top) over bottom-right facecam (bottom)."}
+                    : "Stacks gameplay content (top) over detected facecam (bottom) without distortion."}
                 </p>
               </div>
 

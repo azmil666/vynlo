@@ -386,33 +386,49 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 mode=layout_mode,
                 source_info=source_info,
                 words=words,
+                webcam_region=options.get("webcam_region"),
             )
             actual_layout = getattr(crop_filter, "layout_used", layout_mode)
             clip_coverage = getattr(crop_filter, "coverage", None)
 
             if actual_layout != layout_mode:
-                cov_str = (
-                    f" ({clip_coverage * 100:.1f}%)"
-                    if clip_coverage is not None
-                    else ""
-                )
+                if layout_mode == "split":
+                    fallback_code = "NO_WEBCAM_FOUND"
+                    fallback_msg = (
+                        f"Clip {i}: No stable corner webcam detected; "
+                        f"used '{actual_layout}' layout instead of requested '{layout_mode}'."
+                    )
+                else:
+                    cov_str = (
+                        f" ({clip_coverage * 100:.1f}%)"
+                        if clip_coverage is not None
+                        else ""
+                    )
+                    fallback_code = "LAYOUT_FALLBACK"
+                    fallback_msg = (
+                        f"Clip {i}: Face detection coverage{cov_str} is below threshold "
+                        f"({settings.FACE_COVERAGE_THRESHOLD * 100:.0f}%). "
+                        f"Used '{actual_layout}' layout instead of requested '{layout_mode}'."
+                    )
                 warnings_list.append(
                     JobWarning(
-                        code="LAYOUT_FALLBACK",
-                        message=(
-                            f"Clip {i}: Face detection coverage{cov_str} is below threshold "
-                            f"({settings.FACE_COVERAGE_THRESHOLD * 100:.0f}%). "
-                            f"Used '{actual_layout}' layout instead of requested '{layout_mode}'."
-                        ),
+                        code=fallback_code,
+                        message=fallback_msg,
                         clip_index=i,
                     )
                 )
 
             crop_warnings = getattr(crop_filter, "warnings", [])
             for cw in crop_warnings:
+                if "NO_WEBCAM_FOUND" in cw:
+                    warn_code = "NO_WEBCAM_FOUND"
+                elif "FALLBACK_WEBCAM_GUESS" in cw:
+                    warn_code = "FALLBACK_WEBCAM_GUESS"
+                else:
+                    warn_code = "SPEAKER_TRACKING_FALLBACK"
                 warnings_list.append(
                     JobWarning(
-                        code="SPEAKER_TRACKING_FALLBACK",
+                        code=warn_code,
                         message=f"Clip {i}: {cw}",
                         clip_index=i,
                     )

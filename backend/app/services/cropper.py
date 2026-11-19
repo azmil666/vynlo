@@ -15,7 +15,7 @@ import math
 import os
 import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import cv2
 import numpy as np
@@ -931,10 +931,220 @@ FIT_BLUR_FILTER = (
 )
 
 SPLIT_FILTER = (
-    "[0:v]crop=ih*9/8:ih:(iw-ih*9/8)/2:0,scale=1080:960:flags=lanczos,setsar=1[top];"
-    "[0:v]crop=iw*0.30:ih*0.30:iw*0.70:ih*0.70,scale=1080:960:flags=lanczos,setsar=1[bottom];"
+    "[0:v]crop=min(iw\\,ih*9/8):min(ih\\,iw*8/9):0:0,scale=1080:960:flags=lanczos,setsar=1[top];"
+    "[0:v]crop=ih*0.36*9/8:ih*0.36:iw-ih*0.36*9/8:ih-ih*0.36,scale=1080:960:flags=lanczos,setsar=1[bottom];"
     "[top][bottom]vstack=inputs=2[v]"
 )
+
+
+def get_default_webcam_region(norm_w: int, norm_h: int) -> tuple[int, int, int, int]:
+    """Derive hardcoded bottom-right 9:8 webcam crop box as a last resort."""
+    cam_h = int(norm_h * 0.36)
+    cam_h = max(2, cam_h - (cam_h % 2))
+    cam_w = int(cam_h * 9.0 / 8.0)
+    cam_w = max(2, cam_w - (cam_w % 2))
+    if cam_w > norm_w:
+        cam_w = norm_w - (norm_w % 2)
+        cam_h = int(cam_w * 8.0 / 9.0)
+        cam_h = max(2, cam_h - (cam_h % 2))
+    cam_x = max(0, norm_w - cam_w)
+    cam_y = max(0, norm_h - cam_h)
+    return (cam_x, cam_y, cam_w, cam_h)
+
+
+def find_webcam_region(
+    samples: list[FaceSample],
+    norm_w: int,
+    norm_h: int,
+    user_region: Optional[Union[dict, Any]] = None,
+) -> tuple[Optional[tuple[int, int, int, int]], list[str]]:
+    """Locate webcam region from user input or stable face cluster in corner/perimeter regions.
+
+    Returns (cam_box, warnings). cam_box is (x, y, w, h) in source pixels with a 9:8 aspect ratio.
+    """
+    if user_region is not None:
+        if hasattr(user_region, "x"):
+            rx, ry, rw, rh = float(user_region.x), float(user_region.y), float(user_region.w), float(user_region.h)
+        elif isinstance(user_region, dict):
+            rx, ry, rw, rh = float(user_region.get("x", 0.0)), float(user_region.get("y", 0.0)), float(user_region.get("w", 0.0)), float(user_region.get("h", 0.0))
+        else:
+            rx, ry, rw, rh = 0.0, 0.0, 0.0, 0.0
+
+        px_x = int(rx * norm_w)
+        px_y = int(ry * norm_h)
+        px_w = int(rw * norm_w)
+        px_h = int(rh * norm_h)
+
+        center_x = px_x + px_w / 2.0
+        center_y = px_y + px_h / 2.0
+
+        if px_w / max(1, px_h) > 9.0 / 8.0:
+            box_w = max(2, px_w)
+            box_h = int(box_w * 8.0 / 9.0)
+        else:
+            box_h = max(2, px_h)
+            box_w = int(box_h * 9.0 / 8.0)
+
+        if box_w > norm_w or box_h > norm_h:
+            if norm_w / max(1, norm_h) >= 9.0 / 8.0:
+                box_h = min(norm_h, int(norm_w * 8.0 / 9.0))
+                box_w = int(box_h * 9.0 / 8.0)
+            else:
+                box_w = min(norm_w, int(norm_h * 9.0 / 8.0))
+                box_h = int(box_w * 8.0 / 9.0)
+
+        box_w = max(2, box_w - (box_w % 2))
+        box_h = max(2, box_h - (box_h % 2))
+
+        box_x = int(round(center_x - box_w / 2.0))
+        box_y = int(round(center_y - box_h / 2.0))
+        box_x = max(0, min(box_x, norm_w - box_w))
+        box_y = max(0, min(box_y, norm_h - box_h))
+
+        return (box_x, box_y, box_w, box_h), []
+
+    if not samples:
+        return None, ["NO_WEBCAM_FOUND: No video samples available to locate webcam"]
+
+    tracks = track_faces_across_samples(samples)
+    if not tracks:
+        return None, ["NO_WEBCAM_FOUND: No faces detected across samples"]
+
+    candidates: list[tuple[float, FaceTrack, float, float, float, float]] = []
+    for tr in tracks:
+        if not tr.detections:
+            continue
+        cxs = [d.face.center_x for d in tr.detections]
+        cys = [d.face.center_y for d in tr.detections]
+        mean_cx = sum(cxs) / len(cxs)
+        mean_cy = sum(cys) / len(cys)
+        mean_w = sum(d.face.box[2] for d in tr.detections) / len(tr.detections)
+        mean_h = sum(d.face.box[3] for d in tr.detections) / len(tr.detections)
+
+        norm_cx = mean_cx / float(norm_w)
+        norm_cy = mean_cy / float(norm_h)
+
+        dist_from_center = math.sqrt((norm_cx - 0.5) ** 2 + (norm_cy - 0.5) ** 2)
+        is_corner = (
+            dist_from_center >= 0.20
+            or (norm_cx <= 0.35 or norm_cx >= 0.65)
+            or (norm_cy <= 0.35 or norm_cy >= 0.65)
+        )
+
+        if len(cxs) >= 2:
+            var_x = sum((x - mean_cx) ** 2 for x in cxs) / len(cxs)
+            var_y = sum((y - mean_cy) ** 2 for y in cys) / len(cys)
+            sigma_x = math.sqrt(var_x) / float(norm_w)
+            sigma_y = math.sqrt(var_y) / float(norm_h)
+        else:
+            sigma_x = 0.0
+            sigma_y = 0.0
+
+        is_stable = sigma_x <= 0.08 and sigma_y <= 0.08
+        presence = len(tr.detections) / float(len(samples))
+        is_present = presence >= 0.20 or len(samples) <= 2
+        is_not_huge = (mean_h / float(norm_h)) <= 0.70
+
+        if is_corner and is_stable and is_present and is_not_huge:
+            score = presence * 2.0 + dist_from_center - 3.0 * (sigma_x + sigma_y)
+            candidates.append((score, tr, mean_cx, mean_cy, mean_w, mean_h))
+
+    if not candidates:
+        return None, ["NO_WEBCAM_FOUND: No stable corner webcam detected across samples"]
+
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    _, best_track, mean_cx, mean_cy, mean_w, mean_h = candidates[0]
+
+    # Derive 9:8 crop box with padding around webcam face
+    cam_h = int(mean_h * 2.2)
+    cam_h = max(int(mean_h * 1.5), int(norm_h * 0.28), cam_h)
+    cam_h = min(norm_h, int(norm_h * 0.65), cam_h)
+    cam_w = int(cam_h * 9.0 / 8.0)
+
+    if cam_w > norm_w:
+        cam_w = norm_w
+        cam_h = int(cam_w * 8.0 / 9.0)
+
+    cam_w = max(2, cam_w - (cam_w % 2))
+    cam_h = max(2, cam_h - (cam_h % 2))
+
+    cam_x = int(round(mean_cx - cam_w / 2.0))
+    cam_y = int(round(mean_cy - cam_h * 0.45))
+
+    cam_x = max(0, min(cam_x, norm_w - cam_w))
+    cam_y = max(0, min(cam_y, norm_h - cam_h))
+
+    return (cam_x, cam_y, cam_w, cam_h), []
+
+
+def compute_split_pane_boxes(
+    norm_w: int,
+    norm_h: int,
+    cam_box: tuple[int, int, int, int],
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Compute (top_pane_box, bottom_pane_box) with 9:8 aspect ratio and no duplication."""
+    cam_x, cam_y, cam_w, cam_h = cam_box
+    bottom_pane = (cam_x, cam_y, cam_w, cam_h)
+
+    # Top pane target aspect ratio is 9:8
+    if norm_w >= int(norm_h * 9.0 / 8.0):
+        # Wide / 16:9 / 21:9 source
+        top_h = norm_h - (norm_h % 2)
+        top_w = int(top_h * 9.0 / 8.0)
+        top_w = top_w - (top_w % 2)
+        center_x = (norm_w - top_w) // 2
+
+        cam_cx = cam_x + cam_w / 2.0
+        webcam_is_right = cam_cx >= (norm_w / 2.0)
+
+        if webcam_is_right:
+            # Shift top pane left away from webcam
+            if center_x + top_w > cam_x:
+                top_x = cam_x - top_w
+                if top_x < 0:
+                    # Narrow top pane width to fit strictly left of webcam
+                    top_w = max(2, cam_x - (cam_x % 2))
+                    top_h = int(top_w * 8.0 / 9.0)
+                    top_h = max(2, top_h - (top_h % 2))
+                    top_x = 0
+                else:
+                    top_x = max(0, min(center_x, top_x))
+            else:
+                top_x = center_x
+            top_y = (norm_h - top_h) // 2
+        else:
+            # Webcam is on the left; shift top pane right away from webcam
+            cam_right = cam_x + cam_w
+            if center_x < cam_right:
+                top_x = cam_right
+                if top_x + top_w > norm_w:
+                    # Narrow top pane width to fit strictly right of webcam
+                    avail_w = norm_w - cam_right
+                    top_w = max(2, avail_w - (avail_w % 2))
+                    top_h = int(top_w * 8.0 / 9.0)
+                    top_h = max(2, top_h - (top_h % 2))
+                    top_x = norm_w - top_w
+                else:
+                    top_x = max(center_x, min(top_x, norm_w - top_w))
+            else:
+                top_x = center_x
+            top_y = (norm_h - top_h) // 2
+    else:
+        # Narrow source (norm_w < norm_h * 9 / 8, e.g. 1:1, 4:5, 9:16)
+        top_w = norm_w - (norm_w % 2)
+        top_h = int(top_w * 8.0 / 9.0)
+        top_h = max(2, top_h - (top_h % 2))
+        top_x = 0
+        cam_cy = cam_y + cam_h / 2.0
+        if cam_cy >= (norm_h / 2.0):
+            # Webcam is in bottom half; place top pane at top
+            top_y = 0
+        else:
+            # Webcam is in top half; place top pane at bottom
+            top_y = max(0, norm_h - top_h)
+
+    top_pane = (top_x, top_y, top_w, top_h)
+    return top_pane, bottom_pane
 
 
 class CropFilterResult(str):
@@ -1271,24 +1481,83 @@ def compute_crop_filter(
     force_crop: bool = False,
     coverage_threshold: Optional[float] = None,
     words: Optional[list[dict]] = None,
+    webcam_region: Optional[Any] = None,
+    fallback_to_guess: bool = False,
 ) -> CropFilterResult:
     """Compute crop/scale filter string for FFmpeg single-pass rendering using YuNet neural face detection."""
-    if mode == "split":
-        # Split screen layout: top gameplay, bottom webcam
-        return CropFilterResult(SPLIT_FILTER, layout_used="split", coverage=1.0)
-
     if mode == "fit_blur":
         # Explicit fit with blurred background bars
         return CropFilterResult(FIT_BLUR_FILTER, layout_used="fit_blur", coverage=0.0)
 
     if not (source_info and getattr(source_info, "width", 0) > 0 and getattr(source_info, "height", 0) > 0):
+        if not os.path.exists(video_path):
+            if mode == "split":
+                return CropFilterResult(SPLIT_FILTER, layout_used="split", coverage=1.0)
+            raise ValueError(f"Failed to open video file: {video_path}")
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
+            if mode == "split":
+                return CropFilterResult(SPLIT_FILTER, layout_used="split", coverage=1.0)
             raise ValueError(f"Failed to open video file: {video_path}")
         cap.release()
 
     # 1. Normalize geometry first: apply rotation and non-square SAR before computing crops
     norm_w, norm_h, sar_ratio, rotation = probe_geometry(video_path, source_info=source_info)
+
+    if mode == "split":
+        samples = []
+        if webcam_region is None:
+            samples = sample_faces_sequentially(
+                video_path,
+                start_time,
+                end_time,
+                source_info=source_info,
+            )
+        coverage = compute_detection_coverage(samples) if samples else (1.0 if webcam_region else 0.0)
+
+        cam_box, find_warnings = find_webcam_region(
+            samples, norm_w=norm_w, norm_h=norm_h, user_region=webcam_region
+        )
+
+        if cam_box is None:
+            if force_crop or fallback_to_guess:
+                cam_box = get_default_webcam_region(norm_w, norm_h)
+                find_warnings = ["FALLBACK_WEBCAM_GUESS: Used hardcoded bottom-right webcam region as last resort"]
+            else:
+                return CropFilterResult(
+                    FIT_BLUR_FILTER,
+                    layout_used="fit_blur",
+                    coverage=coverage,
+                    warnings=["NO_WEBCAM_FOUND: No stable corner webcam detected across samples, fell back to single-pane fit_blur layout"],
+                )
+
+        top_box, bottom_box = compute_split_pane_boxes(norm_w, norm_h, cam_box)
+        top_x, top_y, top_w, top_h = top_box
+        cam_x, cam_y, cam_w, cam_h = bottom_box
+
+        top_crop = f"crop={top_w}:{top_h}:{top_x}:{top_y}"
+        bottom_crop = f"crop={cam_w}:{cam_h}:{cam_x}:{cam_y}"
+
+        if abs(sar_ratio - 1.0) > 0.01:
+            split_filter = (
+                f"[0:v]scale=trunc(iw*sar/2)*2:ih,setsar=1,split=2[top_in][bottom_in];"
+                f"[top_in]{top_crop},scale=1080:960:flags=lanczos,setsar=1[top];"
+                f"[bottom_in]{bottom_crop},scale=1080:960:flags=lanczos,setsar=1[bottom];"
+                f"[top][bottom]vstack=inputs=2[v]"
+            )
+        else:
+            split_filter = (
+                f"[0:v]{top_crop},scale=1080:960:flags=lanczos,setsar=1[top];"
+                f"[0:v]{bottom_crop},scale=1080:960:flags=lanczos,setsar=1[bottom];"
+                f"[top][bottom]vstack=inputs=2[v]"
+            )
+
+        return CropFilterResult(
+            split_filter,
+            layout_used="split",
+            coverage=coverage,
+            warnings=find_warnings,
+        )
 
     crop_w = int(norm_h * 9 / 16)
     crop_w = crop_w - (crop_w % 2)
@@ -1392,9 +1661,17 @@ def crop_to_vertical(
     output_path: str,
     mode: str = "speaker",
     words: Optional[list[dict]] = None,
+    webcam_region: Optional[Any] = None,
 ) -> str:
     """Crop video segment [start_time, end_time] to vertical 9:16 (1080x1920)."""
-    crop_filter = compute_crop_filter(video_path, start_time, end_time, mode=mode, words=words)
+    crop_filter = compute_crop_filter(
+        video_path,
+        start_time,
+        end_time,
+        mode=mode,
+        words=words,
+        webcam_region=webcam_region,
+    )
     from app.services.captions import render_clip_single_pass
 
     return render_clip_single_pass(

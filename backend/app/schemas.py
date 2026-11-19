@@ -114,9 +114,18 @@ class JobWarning(BaseModel):
     clip_index: Optional[int] = None
 
 
+class WebcamRegion(BaseModel):
+    """Normalized bounding box coordinates (0.0 to 1.0) defining a webcam region."""
+    x: float = Field(..., ge=0.0, le=1.0)
+    y: float = Field(..., ge=0.0, le=1.0)
+    w: float = Field(..., gt=0.0, le=1.0)
+    h: float = Field(..., gt=0.0, le=1.0)
+
+
 class JobCreateRequest(BaseModel):
     url: HttpUrl
     layout_mode: Literal["speaker", "split"] = "speaker"
+    webcam_region: Optional[WebcamRegion] = None
     max_clips: int = Field(default=3, ge=1, le=10)
     caption_preset: Literal["clean_white", "bold_yellow", "boxed", "minimal"] = "clean_white"
     platform_safe_zone: Literal["shorts", "reels", "tiktok"] = "shorts"

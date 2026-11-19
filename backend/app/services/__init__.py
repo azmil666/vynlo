@@ -55,6 +55,9 @@ from app.services.cropper import (
     select_active_speaker_trajectory,
     track_faces_across_samples,
     verify_yunet_model_present,
+    find_webcam_region,
+    compute_split_pane_boxes,
+    get_default_webcam_region,
 )
 from app.services.downloader import (
     classify_ytdlp_error,
@@ -129,4 +132,7 @@ __all__ = [
     "burn_subtitles",
     "render_clip_single_pass",
     "upload_clip",
+    "find_webcam_region",
+    "compute_split_pane_boxes",
+    "get_default_webcam_region",
 ]
