@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import io
@@ -21,6 +22,7 @@ from app.schemas import (
     JobStatusResponse,
     PipelineErrorCode,
 )
+from app.services.export import build_batch_export_archive
 from app.services.storage import validate_storage_config
 from app.services.sweeper import cleanup_stale_static_files, cleanup_stale_temp_dirs
 from app.worker import process_video_task
@@ -247,8 +249,16 @@ def get_job_status(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/download-all")
-def download_all_clips(job_id: str):
-    """Bundle all generated clips and captions into a single zip archive for batch download."""
+async def download_all_clips(job_id: str):
+    """Bundle all generated clips and captions into a single zip archive for batch download.
+
+    Low-memory, non-blocking streaming export:
+    - Built into a SpooledTemporaryFile with strictly bounded memory footprint.
+    - Uses ZIP_STORED for MP4 video entries and ZIP_DEFLATED for manifest.
+    - Remote clips are fetched with timeouts and size limits in a threadpool without blocking the event loop.
+    - Handles missing or expired files per clip with manifest notes rather than aborting.
+    - Streams the zip response with Content-Disposition attachment header.
+    """
     data = get_redis_client().get(f"job:{job_id}")
     if not data:
         static_job_dir = os.path.join(settings.STATIC_DIR, job_id)
@@ -270,77 +280,25 @@ def download_all_clips(job_id: str):
             status_code=400, detail="Job is not completed or has no clips available"
         )
 
-    zip_buffer = io.BytesIO()
+    # Offload blocking zip generation, disk reads, and remote HTTP streaming to a worker thread
+    spooled_zip = await asyncio.to_thread(build_batch_export_archive, job_id, job_status)
 
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        captions_txt_lines: list[str] = [
-            f"=== CLIPPER STUDIO BATCH EXPORT: JOB {job_id} ===",
-            f"Total Clips: {len(job_status.clips)}",
-            "",
-        ]
+    def iterfile():
+        try:
+            spooled_zip.seek(0)
+            while chunk := spooled_zip.read(64 * 1024):
+                yield chunk
+        finally:
+            spooled_zip.close()
 
-        for i, clip in enumerate(job_status.clips, start=1):
-            slug_title = _slugify(clip.title)
-            mp4_filename = f"{i:02d}_{slug_title}.mp4"
-
-            # 1. Read clip video bytes from local static store or remote S3/R2 URL
-            video_bytes = None
-            local_path = os.path.join(settings.STATIC_DIR, job_id, f"clip_{i}.mp4")
-            if os.path.exists(local_path):
-                try:
-                    with open(local_path, "rb") as f:
-                        video_bytes = f.read()
-                except Exception:
-                    pass
-
-            if not video_bytes and clip.video_url:
-                try:
-                    # Attempt fetch from URL
-                    with urllib.request.urlopen(clip.video_url, timeout=15) as resp:
-                        video_bytes = resp.read()
-                except Exception:
-                    pass
-
-            if video_bytes:
-                zip_file.writestr(mp4_filename, video_bytes)
-
-            # 2. Append social caption & hashtags to text summary
-            formatted_tags = " ".join(
-                f"#{t.lstrip('#')}" for t in clip.hashtags if str(t).strip()
-            )
-            captions_txt_lines.append(f"--- CLIP {i:02d}: {clip.title} ---")
-            captions_txt_lines.append(f"File: {mp4_filename}")
-            captions_txt_lines.append(f"Title: {clip.title}")
-            if clip.description:
-                captions_txt_lines.append(f"Description: {clip.description}")
-            if formatted_tags:
-                captions_txt_lines.append(f"Hashtags: {formatted_tags}")
-            captions_txt_lines.append(
-                f"Duration: {clip.duration}s | Score: {clip.virality_score}/100"
-            )
-            captions_txt_lines.append(
-                f"Selection Method: {clip.selection_method}"
-                + (f" ({clip.selection_reason})" if clip.selection_reason else "")
-            )
-            captions_txt_lines.append(f"Video URL: {clip.video_url}")
-            captions_txt_lines.append("")
-
-        # If no video files could be read, the clips have expired from storage
-        video_files_in_zip = [f for f in zip_file.filelist if f.filename.endswith(".mp4")]
-        if not video_files_in_zip:
-            raise HTTPException(
-                status_code=status.HTTP_410_GONE,
-                detail="Job clips have expired or are missing from storage",
-            )
-
-        zip_file.writestr("captions_and_tags.txt", "\n".join(captions_txt_lines))
-
-    zip_buffer.seek(0)
     filename = f"shorts_{job_id[:8]}.zip"
     return StreamingResponse(
-        zip_buffer,
+        iterfile(),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-cache",
+        },
     )
 
 
