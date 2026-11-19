@@ -9,9 +9,11 @@ Uses OpenCV's neural FaceDetectorYN (YuNet 2023mar ONNX model) with:
 """
 
 import hashlib
+import json
 import logging
 import math
 import os
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -592,6 +594,122 @@ def _get_face_detector(
 
 
 # ============================================================================
+# Geometry Normalization (SAR & Rotation)
+# ============================================================================
+
+def normalize_geometry(
+    raw_w: int,
+    raw_h: int,
+    source_info: Optional[Any] = None,
+) -> tuple[int, int, float, int]:
+    """Compute normalized square-pixel display dimensions accounting for SAR and rotation.
+
+    1. Applies SAR (Sample Aspect Ratio) to compute square-pixel dimensions: W_sq = round(raw_w * sar).
+    2. Applies rotation: 90° or 270° swaps display width and height.
+
+    Returns:
+        (norm_w, norm_h, sar_ratio, rotation)
+    """
+    if raw_w <= 0 or raw_h <= 0:
+        raise ValueError(f"Invalid raw video dimensions: {raw_w}x{raw_h}")
+
+    rotation = getattr(source_info, "rotation", 0) if source_info else 0
+    sar_str = getattr(source_info, "sar", "1:1") if source_info else "1:1"
+    sar_ratio = 1.0
+
+    if sar_str and sar_str not in ("1:1", "0:1", "1", "0", ""):
+        try:
+            num, den = sar_str.replace("/", ":").split(":", 1)
+            num_f, den_f = float(num), float(den)
+            if den_f > 0 and num_f > 0:
+                sar_ratio = num_f / den_f
+        except (ValueError, ZeroDivisionError):
+            sar_ratio = 1.0
+
+    # Square pixel dimensions
+    w_sq = int(round(raw_w * sar_ratio))
+    w_sq = max(2, w_sq - (w_sq % 2))
+    h_sq = max(2, raw_h - (raw_h % 2))
+
+    # Rotation (90 / 270 swaps display width and height)
+    if rotation in (90, 270):
+        norm_w, norm_h = h_sq, w_sq
+    else:
+        norm_w, norm_h = w_sq, h_sq
+
+    return norm_w, norm_h, sar_ratio, rotation
+
+
+def probe_geometry(video_path: str, source_info: Optional[Any] = None) -> tuple[int, int, float, int]:
+    """Probe geometry directly if source_info is not provided or incomplete."""
+    if source_info and getattr(source_info, "width", 0) > 0 and getattr(source_info, "height", 0) > 0:
+        return normalize_geometry(source_info.width, source_info.height, source_info=source_info)
+
+    raw_w, raw_h = 0, 0
+    rotation = 0
+    sar_str = "1:1"
+
+    if os.path.exists(video_path):
+        try:
+            cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,sample_aspect_ratio,side_data_list:stream_tags=rotate",
+                "-of",
+                "json",
+                video_path,
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+            if res.returncode == 0 and res.stdout:
+                data = json.loads(res.stdout)
+                streams = data.get("streams", [])
+                if streams:
+                    v = streams[0]
+                    raw_w = int(v.get("width", 0) or 0)
+                    raw_h = int(v.get("height", 0) or 0)
+                    sar_str = str(v.get("sample_aspect_ratio", "1:1") or "1:1")
+                    tags = v.get("tags", {})
+                    if "rotate" in tags:
+                        try:
+                            rotation = abs(int(float(tags["rotate"]))) % 360
+                        except (ValueError, TypeError):
+                            pass
+                    if rotation == 0:
+                        for sd in v.get("side_data_list", []):
+                            if "rotation" in sd:
+                                try:
+                                    rotation = abs(int(float(sd["rotation"]))) % 360
+                                except (ValueError, TypeError):
+                                    pass
+        except Exception:
+            pass
+
+    if raw_w <= 0 or raw_h <= 0:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+
+    if raw_w <= 0 or raw_h <= 0:
+        raise ValueError(f"Failed to read valid video dimensions from {video_path}")
+
+    from app.schemas import SourceInfo
+    info = source_info or SourceInfo(
+        width=raw_w,
+        height=raw_h,
+        duration=0.0,
+        rotation=rotation,
+        sar=sar_str,
+    )
+    return normalize_geometry(raw_w, raw_h, source_info=info)
+
+
+# ============================================================================
 # Aspect-Preserving Scaling & Face Detection
 # ============================================================================
 
@@ -725,6 +843,16 @@ def sample_faces_sequentially(
     hz = sample_hz if sample_hz is not None else getattr(settings, "FACE_DETECTION_SAMPLE_HZ", 4.0)
     step = 1.0 / max(0.1, hz)
     rotation = getattr(source_info, "rotation", 0) if source_info else 0
+    sar_str = getattr(source_info, "sar", "1:1") if source_info else "1:1"
+    sar_ratio = 1.0
+    if sar_str and sar_str not in ("1:1", "0:1", "1", "0", ""):
+        try:
+            num, den = sar_str.replace("/", ":").split(":", 1)
+            num_f, den_f = float(num), float(den)
+            if den_f > 0 and num_f > 0:
+                sar_ratio = num_f / den_f
+        except (ValueError, ZeroDivisionError):
+            sar_ratio = 1.0
 
     samples: list[FaceSample] = []
     duration = max(0.0, end_time - start_time)
@@ -770,6 +898,12 @@ def sample_faces_sequentially(
                     elif rotation == 270:
                         frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
+                    # Normalize SAR to square pixels if non-square
+                    if abs(sar_ratio - 1.0) > 0.01 and sar_ratio > 0:
+                        new_w = max(2, int(round(frame.shape[1] * sar_ratio)))
+                        new_w = new_w - (new_w % 2)
+                        frame = cv2.resize(frame, (new_w, frame.shape[0]))
+
                     faces = detect_faces_in_frame(active_detector, frame)
                     samples.append(FaceSample(timestamp=round(current_time, 3), faces=faces))
                 else:
@@ -789,8 +923,10 @@ def sample_faces_sequentially(
 # ============================================================================
 
 FIT_BLUR_FILTER = (
-    "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:20,setsar=1[bg];"
-    "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[fg];"
+    "[0:v]scale=trunc(iw*sar/2)*2:ih,setsar=1[norm];"
+    "[norm]split=2[bg_in][fg_in];"
+    "[bg_in]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:20,drawbox=c=black@0.25:t=fill,setsar=1[bg];"
+    "[fg_in]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[fg];"
     "[bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
 )
 
@@ -1145,108 +1281,108 @@ def compute_crop_filter(
         # Explicit fit with blurred background bars
         return CropFilterResult(FIT_BLUR_FILTER, layout_used="fit_blur", coverage=0.0)
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise ValueError(f"Failed to open video file: {video_path}")
-
-    try:
-        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        # Normalize dimensions if video stream contains rotation metadata
-        if source_info and getattr(source_info, "rotation", 0) in (90, 270):
-            frame_w, frame_h = frame_h, frame_w
-
-        if frame_w <= 0 or frame_h <= 0:
-            raise ValueError(f"Failed to read valid video dimensions from {video_path}")
-
-        crop_w = int(frame_h * 9 / 16)
-        crop_w = crop_w - (crop_w % 2)
-
-        # Handle Already-Vertical Source Videos
-        if frame_w <= frame_h * 0.75 or crop_w >= frame_w:
-            vert_filter = (
-                "scale=1080:1920:force_original_aspect_ratio=decrease,"
-                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1"
-            )
-            return CropFilterResult(vert_filter, layout_used="speaker", coverage=1.0)
-
-        duration = max(0.1, end_time - start_time)
-        samples = sample_faces_sequentially(
-            video_path,
-            start_time,
-            end_time,
-            source_info=source_info,
-        )
-
-        coverage = compute_detection_coverage(samples)
-        cov_thresh = (
-            coverage_threshold
-            if coverage_threshold is not None
-            else getattr(settings, "FACE_COVERAGE_THRESHOLD", 0.40)
-        )
-
-        # Fall back to fit_blur if coverage is below threshold or zero faces detected
-        if (coverage < cov_thresh or coverage == 0.0) and not force_crop:
-            return CropFilterResult(FIT_BLUR_FILTER, layout_used="fit_blur", coverage=coverage)
-
-        sample_times = [s.timestamp for s in samples] if samples else [start_time]
-
-        filter_warnings: list[str] = []
-        if getattr(settings, "SPEAKER_TRACKING_ENABLED", True) and samples:
-            raw_centers, spk_warnings = select_active_speaker_trajectory(
-                samples=samples,
-                frame_w=frame_w,
-                frame_h=frame_h,
-                crop_w=crop_w,
-                words=words,
-            )
-            filter_warnings.extend(spk_warnings)
-        else:
-            raw_centers = (
-                [
-                    float(s.primary_face.center_x / float(frame_w))
-                    if s.primary_face
-                    else None
-                    for s in samples
-                ]
-                if samples
-                else [0.5]
-            )
-
-        clean_centers = fill_face_timeline(sample_times, raw_centers)
-
-        # Generate smooth continuous camera path with dead zone and ease-in/out pan limits
-        path = generate_smooth_camera_path(
-            sample_times=sample_times,
-            clean_centers=clean_centers,
-            start_time=start_time,
-            duration=duration,
-            frame_w=frame_w,
-            crop_w=crop_w,
-        )
-
-        simplify_eps = getattr(settings, "CROP_SIMPLIFY_EPSILON", 2.0)
-        max_kf = getattr(settings, "CROP_MAX_KEYFRAMES", 40)
-        keyframes = douglas_peucker_keyframes(path, epsilon=simplify_eps, max_keyframes=max_kf)
-
-        max_crop_x = max(0, frame_w - crop_w)
-        crop_expr = build_piecewise_linear_crop_expr(keyframes, max_crop_x)
-
-        if crop_expr.isdigit() or (crop_expr.replace("-", "").isdigit()):
-            res_str = f"crop={crop_w}:{frame_h}:{crop_expr}:0,scale=1080:1920:flags=lanczos,setsar=1"
-        else:
-            res_str = f"crop={crop_w}:{frame_h}:x='{crop_expr}':y=0,scale=1080:1920:flags=lanczos,setsar=1"
-
-        return CropFilterResult(
-            res_str,
-            layout_used="speaker",
-            coverage=coverage,
-            warnings=filter_warnings,
-        )
-
-    finally:
+    if not (source_info and getattr(source_info, "width", 0) > 0 and getattr(source_info, "height", 0) > 0):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video file: {video_path}")
         cap.release()
+
+    # 1. Normalize geometry first: apply rotation and non-square SAR before computing crops
+    norm_w, norm_h, sar_ratio, rotation = probe_geometry(video_path, source_info=source_info)
+
+    crop_w = int(norm_h * 9 / 16)
+    crop_w = crop_w - (crop_w % 2)
+
+    dar = float(norm_w) / float(norm_h)
+    target_dar = 9.0 / 16.0
+
+    # 2. Exact 9:16 source passes through scaled with no distortion or black padding
+    if abs(dar - target_dar) < 0.01 or crop_w == norm_w:
+        sar_prefix = "scale=trunc(iw*sar/2)*2:ih,setsar=1," if abs(sar_ratio - 1.0) > 0.01 else ""
+        exact_filter = f"{sar_prefix}scale=1080:1920:flags=lanczos,setsar=1"
+        return CropFilterResult(exact_filter, layout_used="speaker", coverage=1.0)
+
+    # 3. Source is narrower than 9:16 (Wcrop > norm_w, e.g. 1:2)
+    # A 9:16 crop cannot fit horizontally without cutting top/bottom or out of bounds -> use fit_blur
+    if norm_w < crop_w:
+        return CropFilterResult(FIT_BLUR_FILTER, layout_used="fit_blur", coverage=0.0)
+
+    # 4. Source is wider than 9:16 (Wcrop < norm_w): crop fits!
+    duration = max(0.1, end_time - start_time)
+    samples = sample_faces_sequentially(
+        video_path,
+        start_time,
+        end_time,
+        source_info=source_info,
+    )
+
+    coverage = compute_detection_coverage(samples)
+    cov_thresh = (
+        coverage_threshold
+        if coverage_threshold is not None
+        else getattr(settings, "FACE_COVERAGE_THRESHOLD", 0.40)
+    )
+
+    # Fall back to fit_blur if coverage is below threshold or zero faces detected
+    if (coverage < cov_thresh or coverage == 0.0) and not force_crop:
+        return CropFilterResult(FIT_BLUR_FILTER, layout_used="fit_blur", coverage=coverage)
+
+    sample_times = [s.timestamp for s in samples] if samples else [start_time]
+
+    filter_warnings: list[str] = []
+    if getattr(settings, "SPEAKER_TRACKING_ENABLED", True) and samples:
+        raw_centers, spk_warnings = select_active_speaker_trajectory(
+            samples=samples,
+            frame_w=norm_w,
+            frame_h=norm_h,
+            crop_w=crop_w,
+            words=words,
+        )
+        filter_warnings.extend(spk_warnings)
+    else:
+        raw_centers = (
+            [
+                float(s.primary_face.center_x / float(norm_w))
+                if s.primary_face
+                else None
+                for s in samples
+            ]
+            if samples
+            else [0.5]
+        )
+
+    clean_centers = fill_face_timeline(sample_times, raw_centers)
+
+    # Generate smooth continuous camera path with dead zone and ease-in/out pan limits
+    path = generate_smooth_camera_path(
+        sample_times=sample_times,
+        clean_centers=clean_centers,
+        start_time=start_time,
+        duration=duration,
+        frame_w=norm_w,
+        crop_w=crop_w,
+    )
+
+    simplify_eps = getattr(settings, "CROP_SIMPLIFY_EPSILON", 2.0)
+    max_kf = getattr(settings, "CROP_MAX_KEYFRAMES", 40)
+    keyframes = douglas_peucker_keyframes(path, epsilon=simplify_eps, max_keyframes=max_kf)
+
+    max_crop_x = max(0, norm_w - crop_w)
+    crop_expr = build_piecewise_linear_crop_expr(keyframes, max_crop_x)
+
+    sar_prefix = "scale=trunc(iw*sar/2)*2:ih,setsar=1," if abs(sar_ratio - 1.0) > 0.01 else ""
+
+    if crop_expr.isdigit() or (crop_expr.replace("-", "").isdigit()):
+        res_str = f"{sar_prefix}crop={crop_w}:{norm_h}:{crop_expr}:0,scale=1080:1920:flags=lanczos,setsar=1"
+    else:
+        res_str = f"{sar_prefix}crop={crop_w}:{norm_h}:x='{crop_expr}':y=0,scale=1080:1920:flags=lanczos,setsar=1"
+
+    return CropFilterResult(
+        res_str,
+        layout_used="speaker",
+        coverage=coverage,
+        warnings=filter_warnings,
+    )
 
 
 def crop_to_vertical(

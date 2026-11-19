@@ -22,13 +22,11 @@ class TestComputeCropFilterOutputStrings:
             compute_crop_filter("/invalid/path/non_existent.mp4", 0.0, 5.0, mode="speaker")
         assert "Failed to open video file" in str(exc.value)
 
-    def test_speaker_mode_vertical_video_returns_scale_and_pad(self, video_vertical: str):
-        # Already vertical video (1080x1920, frame_w <= frame_h * 0.75)
+    def test_speaker_mode_vertical_video_exact_9_16_scaled_no_pad(self, video_vertical: str):
+        # Exact 9:16 video (1080x1920) passes through scaled with no distortion or black padding
         filter_str = compute_crop_filter(video_vertical, 0.0, 2.0, mode="speaker")
-        assert (
-            filter_str
-            == "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1"
-        )
+        assert filter_str == "scale=1080:1920:flags=lanczos,setsar=1"
+        assert filter_str.layout_used == "speaker"
 
     def test_speaker_mode_landscape_16_9_no_faces_falls_back_to_fit_blur(self, video_16_9_30s: str):
         # 16:9 test pattern without detected human faces falls back to fit_blur instead of dead-center crop
