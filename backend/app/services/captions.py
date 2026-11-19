@@ -912,6 +912,7 @@ def render_clip_single_pass(
     timeout_multiplier: float = 4.0,
     base_timeout: float = 30.0,
     validate_output: bool = True,
+    threads: int | None = None,
 ) -> str:
     """Render 9:16 clip with normalized frame rate, two-pass loudnorm, scaled timeout, and ffprobe validation."""
     out_dir = os.path.dirname(output_path)
@@ -1040,8 +1041,10 @@ def render_clip_single_pass(
         "48000",
         "-ac",
         "2",
-        output_path,
     ])
+    if threads is not None and threads > 0:
+        cmd.extend(["-threads", str(threads)])
+    cmd.append(output_path)
 
     # Run FFmpeg in a new process group to enable clean termination on timeout
     proc = subprocess.Popen(

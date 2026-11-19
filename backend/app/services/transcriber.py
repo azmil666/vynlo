@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from typing import Any, Optional
 
@@ -60,21 +61,28 @@ def get_whisper_model() -> WhisperModel:
     if _cached_model is not None:
         return _cached_model
 
+    cpu_threads = getattr(settings, "WHISPER_CPU_THREADS", 4)
+    if cpu_threads <= 0:
+        cpu_threads = max(1, min(4, (os.cpu_count() or 4) // 2))
+
     current_key = (
         settings.WHISPER_MODEL_SIZE,
         settings.WHISPER_DEVICE,
         settings.WHISPER_COMPUTE_TYPE,
+        cpu_threads,
     )
     logger.info(
-        "Loading WhisperModel(size=%s, device=%s, compute_type=%s)",
+        "Loading WhisperModel(size=%s, device=%s, compute_type=%s, cpu_threads=%d)",
         settings.WHISPER_MODEL_SIZE,
         settings.WHISPER_DEVICE,
         settings.WHISPER_COMPUTE_TYPE,
+        cpu_threads,
     )
     _cached_model = WhisperModel(
         settings.WHISPER_MODEL_SIZE,
         device=settings.WHISPER_DEVICE,
         compute_type=settings.WHISPER_COMPUTE_TYPE,
+        cpu_threads=cpu_threads,
     )
     _cached_model_key = current_key
     return _cached_model

@@ -3,6 +3,7 @@ import json
 import logging
 import resource
 import sys
+import threading
 import time
 from typing import Any, Optional
 
@@ -111,6 +112,7 @@ class PipelineMetricsTracker:
         self.start_rss_mb: float = get_peak_rss_mb()
         self._active_stage_context: Optional[StageContext] = None
         self._context_token: Optional[contextvars.Token] = None
+        self._lock = threading.Lock()
 
         # Cumulative elapsed seconds per stage
         self.stage_durations: dict[str, float] = {
@@ -144,16 +146,17 @@ class PipelineMetricsTracker:
         clip_index: Optional[int] = None,
     ) -> None:
         """Internal callback when a StageContext finishes."""
-        if stage_name not in self.stage_durations:
-            self.stage_durations[stage_name] = 0.0
-        self.stage_durations[stage_name] += duration
+        with self._lock:
+            if stage_name not in self.stage_durations:
+                self.stage_durations[stage_name] = 0.0
+            self.stage_durations[stage_name] += duration
 
-        if clip_index is not None:
-            if clip_index not in self.clip_metrics:
-                self.clip_metrics[clip_index] = {}
-            if stage_name not in self.clip_metrics[clip_index]:
-                self.clip_metrics[clip_index][stage_name] = 0.0
-            self.clip_metrics[clip_index][stage_name] += duration
+            if clip_index is not None:
+                if clip_index not in self.clip_metrics:
+                    self.clip_metrics[clip_index] = {}
+                if stage_name not in self.clip_metrics[clip_index]:
+                    self.clip_metrics[clip_index][stage_name] = 0.0
+                self.clip_metrics[clip_index][stage_name] += duration
 
     def record_stage(
         self,
@@ -181,26 +184,27 @@ class PipelineMetricsTracker:
         """Serialize metrics into structured dictionary conforming to JobStatusResponse internal field."""
         peak_rss = get_peak_rss_mb()
         stages_dict: dict[str, float] = {}
-
-        for stage in self.STANDARD_STAGES:
-            stages_dict[stage] = round(self.stage_durations.get(stage, 0.0), 3)
-
-        # Include any custom/extra stages recorded
-        for stage, duration in self.stage_durations.items():
-            if stage not in stages_dict:
-                stages_dict[stage] = round(duration, 3)
-
         clips_list: list[dict[str, Any]] = []
-        for idx in sorted(self.clip_metrics.keys()):
-            clip_data = self.clip_metrics[idx]
-            clip_entry: dict[str, Any] = {"clip_index": idx}
-            clip_total = 0.0
-            for k, v in clip_data.items():
-                rounded_v = round(v, 3)
-                clip_entry[k] = rounded_v
-                clip_total += rounded_v
-            clip_entry["total"] = round(clip_total, 3)
-            clips_list.append(clip_entry)
+
+        with self._lock:
+            for stage in self.STANDARD_STAGES:
+                stages_dict[stage] = round(self.stage_durations.get(stage, 0.0), 3)
+
+            # Include any custom/extra stages recorded
+            for stage, duration in self.stage_durations.items():
+                if stage not in stages_dict:
+                    stages_dict[stage] = round(duration, 3)
+
+            for idx in sorted(self.clip_metrics.keys()):
+                clip_data = self.clip_metrics[idx]
+                clip_entry: dict[str, Any] = {"clip_index": idx}
+                clip_total = 0.0
+                for k, v in clip_data.items():
+                    rounded_v = round(v, 3)
+                    clip_entry[k] = rounded_v
+                    clip_total += rounded_v
+                clip_entry["total"] = round(clip_total, 3)
+                clips_list.append(clip_entry)
 
         return {
             "stages": stages_dict,

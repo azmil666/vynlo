@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Optional
 from uuid import uuid4
 
 # Ensure backend root is on sys.path
@@ -35,7 +37,7 @@ os.environ.setdefault("TEMP_DIR", "/tmp/clipper")
 
 import fakeredis
 
-from app.config import settings
+from app.config import get_render_concurrency, settings
 from app.schemas import SourceInfo, TranscriptValidation
 from app.services.analyzer import find_viral_clips, set_llm_client
 from app.services.captions import generate_ass_subtitles, render_clip_single_pass
@@ -113,6 +115,7 @@ def run_profiled_pipeline(
     layout_mode: str = "speaker",
     use_mock_transcribe: bool = False,
     use_fake_llm: bool = False,
+    concurrency: Optional[int] = None,
 ) -> dict:
     """Run pipeline end-to-end with per-stage timing and resource measurement."""
     # Isolate Redis with FakeRedis for profiling run
@@ -127,15 +130,15 @@ def run_profiled_pipeline(
             "clips": [
                 {
                     "start_time": 0.5,
-                    "end_time": 8.0,
+                    "end_time": 7.0,
                     "title": "Profiling Test Clip 1",
                     "virality_score": 88,
                     "description": "Benchmark clip 1 for pipeline timing",
                     "hashtags": ["#benchmark", "#profiling"],
                 },
                 {
-                    "start_time": 5.0,
-                    "end_time": 12.0,
+                    "start_time": 6.0,
+                    "end_time": 13.0,
                     "title": "Profiling Test Clip 2",
                     "virality_score": 82,
                     "description": "Benchmark clip 2 for pipeline timing",
@@ -193,8 +196,11 @@ def run_profiled_pipeline(
                 candidates = find_viral_clips(words, max_clips=max_clips)
 
             # 6. Clip processing loop (Face detection, Render, Upload)
-            completed_clips = []
-            for i, clip in enumerate(candidates[:max_clips], start=1):
+            target_clips = candidates[:max_clips]
+            derived_concurrency, ffmpeg_threads = get_render_concurrency(len(target_clips))
+            actual_concurrency = concurrency if concurrency is not None else derived_concurrency
+
+            def process_profile_clip(i: int, clip: dict) -> dict:
                 ass_path = str(work_dir / f"clip_{i}.ass")
                 final_path = str(work_dir / f"final_clip_{i}.mp4")
                 upload_key = f"{job_id}/clip_{i}.mp4"
@@ -228,17 +234,32 @@ def run_profiled_pipeline(
                         crop_filter=crop_filter,
                         ass_path=ass_path,
                         output_path=final_path,
+                        threads=ffmpeg_threads,
                     )
 
                 with tracker.stage("upload", clip_index=i):
                     pub_url = upload_clip(final_path, upload_key)
 
-                completed_clips.append({
+                return {
                     "clip_index": i,
                     "title": clip.get("title", f"Clip {i}"),
                     "duration": round(clip["end_time"] - clip["start_time"], 2),
                     "url": pub_url,
-                })
+                }
+
+            completed_clips = []
+            if actual_concurrency <= 1:
+                for i, clip in enumerate(target_clips, start=1):
+                    completed_clips.append(process_profile_clip(i, clip))
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=actual_concurrency) as executor:
+                    futures = [
+                        executor.submit(process_profile_clip, i, clip)
+                        for i, clip in enumerate(target_clips, start=1)
+                    ]
+                    for fut in concurrent.futures.as_completed(futures):
+                        completed_clips.append(fut.result())
+                completed_clips.sort(key=lambda c: c["clip_index"])
 
         metrics = tracker.to_dict()
         metrics["source_duration"] = source_info.duration if source_info else (meta_duration or 0.0)
@@ -355,6 +376,7 @@ def main() -> None:
     parser.add_argument("--mock-transcribe", action="store_true", help="Use bundled transcript fixture instead of running Whisper.")
     parser.add_argument("--fake-llm", action="store_true", default=True, help="Use FakeLLM for zero-cost offline profiling (default).")
     parser.add_argument("--real-llm", action="store_true", help="Call real LLM API (requires network and LLM_API_KEY).")
+    parser.add_argument("--concurrency", type=int, default=None, help="Clip render concurrency (default: auto derived from CPU cores).")
     parser.add_argument("--json", action="store_true", help="Print raw JSON metrics output.")
 
     args = parser.parse_args()
@@ -386,6 +408,7 @@ def main() -> None:
             layout_mode=args.layout_mode,
             use_mock_transcribe=args.mock_transcribe,
             use_fake_llm=not args.real_llm,
+            concurrency=args.concurrency,
         )
 
         if args.json:

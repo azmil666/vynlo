@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -137,10 +138,18 @@ class Settings(BaseSettings):
     LONG_VIDEO_MAX_HEIGHT: int = 720
     DURATION_TOLERANCE_SECONDS: float = 15.0
 
+    # Rendering Concurrency & Thread Budgeting
+    # 0 = auto-derive from CPU cores (up to 2 concurrent clips on >=4 cores, 1 on lower)
+    # 1 = serial execution
+    # >1 = explicit concurrency limit
+    RENDER_CONCURRENCY: int = 0
+    FFMPEG_THREADS_PER_CLIP: Optional[int] = None
+
     # Faster-Whisper ASR configuration
     WHISPER_MODEL_SIZE: str = "base"
     WHISPER_DEVICE: str = "cpu"
     WHISPER_COMPUTE_TYPE: str = "int8"
+    WHISPER_CPU_THREADS: int = 4
     WHISPER_LANGUAGE: Optional[str] = None  # None = auto-detect
     WHISPER_BEAM_SIZE: int = 5
     WHISPER_VAD_FILTER: bool = True
@@ -229,4 +238,28 @@ def validate_retention_config(cfg: Settings) -> None:
                 f"Invalid retention configuration: S3_RETENTION_DAYS ({cfg.S3_RETENTION_DAYS}d = "
                 f"{cfg.S3_RETENTION_DAYS * 86400}s) must be >= JOB_RECORD_TTL_SECONDS ({job_ttl}s)."
             )
+
+
+def get_render_concurrency(candidates_count: int, cfg: Optional[Settings] = None) -> tuple[int, int]:
+    """Derive rendering concurrency N and ffmpeg threads per clip from CPU cores.
+
+    Returns (concurrency, threads_per_clip).
+    Guarantees no CPU oversubscription: concurrency * threads_per_clip <= total_cores (or within headroom).
+    """
+    active_cfg = cfg or settings
+    total_cores = os.cpu_count() or 4
+    if active_cfg.RENDER_CONCURRENCY > 0:
+        concurrency = min(candidates_count, active_cfg.RENDER_CONCURRENCY)
+    else:
+        # Default auto: up to 2 concurrent clips on systems with >= 4 cores, or 1 on low-core systems
+        concurrency = min(candidates_count, 2 if total_cores >= 4 else 1)
+
+    concurrency = max(1, concurrency)
+
+    if active_cfg.FFMPEG_THREADS_PER_CLIP and active_cfg.FFMPEG_THREADS_PER_CLIP > 0:
+        threads_per_clip = active_cfg.FFMPEG_THREADS_PER_CLIP
+    else:
+        threads_per_clip = max(1, total_cores // concurrency)
+
+    return concurrency, threads_per_clip
 
