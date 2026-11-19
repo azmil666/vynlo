@@ -8,7 +8,10 @@ import assert from "node:assert/strict";
 import {
   ERROR_CODE_MAP,
   calculatePollingBackoff,
+  copyToClipboard,
+  downloadClip,
   getApiBaseUrl,
+  getLayoutNote,
   getStoredJobId,
   getStructuredError,
   isJobStalled,
@@ -334,5 +337,246 @@ describe("Mock Fetch Polling State Transitions", () => {
     controller.abort();
 
     await assert.rejects(fetchPromise, { message: "AbortError" });
+  });
+});
+
+describe("Copy to Clipboard with Fallbacks", () => {
+  const origNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+
+  afterEach(() => {
+    if (origNavigator) {
+      Object.defineProperty(globalThis, "navigator", origNavigator);
+    }
+    delete global.document;
+    delete global.window;
+  });
+
+  it("uses navigator.clipboard.writeText when available and supported", async () => {
+    let written = "";
+    global.window = {};
+    Object.defineProperty(globalThis, "navigator", {
+      value: {
+        clipboard: {
+          writeText: async (t) => {
+            written = t;
+          },
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+
+    const res = await copyToClipboard("Caption text");
+    assert.strictEqual(res, true);
+    assert.strictEqual(written, "Caption text");
+  });
+
+  it("falls back to document.execCommand when navigator.clipboard fails or throws", async () => {
+    global.window = {};
+    Object.defineProperty(globalThis, "navigator", {
+      value: {
+        clipboard: {
+          writeText: async () => {
+            throw new Error("Permission denied");
+          },
+        },
+      },
+      configurable: true,
+      writable: true,
+    });
+
+    let executedCommand = "";
+    const createdElements = [];
+    global.document = {
+      createElement: (tag) => {
+        const el = {
+          tag,
+          style: {},
+          setAttribute: () => {},
+          focus: () => {},
+          select: () => {},
+          setSelectionRange: () => {},
+        };
+        createdElements.push(el);
+        return el;
+      },
+      body: {
+        appendChild: () => {},
+        removeChild: () => {},
+      },
+      execCommand: (cmd) => {
+        executedCommand = cmd;
+        return true;
+      },
+    };
+
+    const res = await copyToClipboard("Fallback caption");
+    assert.strictEqual(res, true);
+    assert.strictEqual(executedCommand, "copy");
+    assert.strictEqual(createdElements[0].value, "Fallback caption");
+  });
+
+  it("returns false when both clipboard API and execCommand fail", async () => {
+    global.window = {};
+    Object.defineProperty(globalThis, "navigator", {
+      value: {},
+      configurable: true,
+      writable: true,
+    });
+    global.document = {
+      createElement: () => ({
+        style: {},
+        setAttribute: () => {},
+        focus: () => {},
+        select: () => {},
+        setSelectionRange: () => {},
+      }),
+      body: {
+        appendChild: () => {},
+        removeChild: () => {},
+      },
+      execCommand: () => false,
+    };
+
+    const res = await copyToClipboard("Impossible copy");
+    assert.strictEqual(res, false);
+  });
+});
+
+describe("Cross-Origin Media Download", () => {
+  const origURL = global.URL;
+
+  afterEach(() => {
+    delete global.window;
+    delete global.fetch;
+    delete global.document;
+    global.URL = origURL;
+  });
+
+  it("fetches blob, reports progress, and triggers object URL download click", async () => {
+    global.window = {};
+    let createdUrl = "";
+    let clickedHref = "";
+    let clickedDownload = "";
+
+    global.URL = {
+      createObjectURL: () => {
+        createdUrl = "blob:http://localhost:3000/123-abc";
+        return createdUrl;
+      },
+      revokeObjectURL: () => {},
+    };
+
+    global.document = {
+      createElement: (tag) => ({
+        tag,
+        click: function () {
+          clickedHref = this.href;
+          clickedDownload = this.download;
+        },
+      }),
+      body: {
+        appendChild: () => {},
+        removeChild: () => {},
+      },
+    };
+
+    global.fetch = async () => ({
+      ok: true,
+      headers: {
+        get: (h) => (h === "content-length" ? "100" : null),
+      },
+      blob: async () => ({ size: 100, type: "video/mp4" }),
+    });
+
+    const progressValues = [];
+    await downloadClip("https://cdn.example.com/video.mp4", "my_clip.mp4", undefined, (p) => {
+      progressValues.push(p);
+    });
+
+    assert.strictEqual(clickedHref, "blob:http://localhost:3000/123-abc");
+    assert.strictEqual(clickedDownload, "my_clip.mp4");
+    assert.ok(progressValues.includes(100));
+  });
+
+  it("falls back to backend attachment endpoint when CORS blob fetch fails", async () => {
+    global.window = {};
+    let clickedHref = "";
+    let clickedDownload = "";
+
+    global.document = {
+      createElement: (tag) => ({
+        tag,
+        click: function () {
+          clickedHref = this.href;
+          clickedDownload = this.download;
+        },
+      }),
+      body: {
+        appendChild: () => {},
+        removeChild: () => {},
+      },
+    };
+
+    // Simulate CORS network block
+    global.fetch = async () => {
+      throw new Error("Failed to fetch due to CORS");
+    };
+
+    const fallbackUrl = "http://localhost:8000/api/jobs/job123/clips/c1/download";
+    await downloadClip("https://s3.amazonaws.com/cors-blocked.mp4", "fallback.mp4", fallbackUrl);
+
+    assert.strictEqual(clickedHref, fallbackUrl);
+    assert.strictEqual(clickedDownload, "fallback.mp4");
+  });
+});
+
+describe("Selection Method Badges & Layout Notes", () => {
+  it("extracts full-frame layout note when no face was detected", () => {
+    const clip = {
+      clip_id: "c1",
+      title: "Clip 1",
+      virality_score: 80,
+      duration: 30.0,
+      layout_used: "fit_blur",
+      warnings: ["NO_FACE_DETECTED: No face detected, used full-frame layout"],
+    };
+
+    const note = getLayoutNote(clip);
+    assert.ok(note);
+    assert.strictEqual(note.label, "Full-frame (no face)");
+    assert.strictEqual(note.isDegraded, true);
+  });
+
+  it("extracts split layout note", () => {
+    const clip = {
+      clip_id: "c2",
+      title: "Clip 2",
+      virality_score: 85,
+      duration: 25.0,
+      layout_used: "split",
+      warnings: [],
+    };
+
+    const note = getLayoutNote(clip);
+    assert.ok(note);
+    assert.strictEqual(note.label, "Split layout");
+    assert.strictEqual(note.isDegraded, false);
+  });
+
+  it("extracts speaker tracked note for standard smart crop", () => {
+    const clip = {
+      clip_id: "c3",
+      title: "Clip 3",
+      virality_score: 92,
+      duration: 20.0,
+      layout_used: "speaker",
+      warnings: [],
+    };
+
+    const note = getLayoutNote(clip);
+    assert.ok(note);
+    assert.strictEqual(note.label, "Speaker tracked");
+    assert.strictEqual(note.isDegraded, false);
   });
 });

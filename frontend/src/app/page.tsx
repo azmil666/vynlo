@@ -12,7 +12,10 @@ import type {
 } from "@/types/api";
 import {
   calculatePollingBackoff,
+  copyToClipboard,
+  downloadClip,
   getApiBaseUrl,
+  getLayoutNote,
   getStoredJobId,
   getStructuredError,
   isJobStalled,
@@ -159,6 +162,11 @@ export default function HomePage() {
 
   const [isMac, setIsMac] = useState(false);
   const [copiedKeys, setCopiedKeys] = useState<Record<string, boolean>>({});
+  const [copyStatus, setCopyStatus] = useState<Record<string, "idle" | "copied" | "error">>({});
+  const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
+  const [videoErrors, setVideoErrors] = useState<Record<string, boolean>>({});
+  const [videoReloadKey, setVideoReloadKey] = useState<Record<string, number>>({});
+  const [liveAnnouncement, setLiveAnnouncement] = useState("");
 
   // Detect platform in useEffect to avoid hydration mismatch
   useEffect(() => {
@@ -397,17 +405,66 @@ export default function HomePage() {
     setStoredJobId(null);
   }, []);
 
-  const handleCopy = useCallback(async (key: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedKeys((prev) => ({ ...prev, [key]: true }));
-      setTimeout(() => {
+  const handleCopy = useCallback(
+    async (key: string, text: string, itemLabel = "Content") => {
+      const success = await copyToClipboard(text);
+      if (success) {
+        setCopiedKeys((prev) => ({ ...prev, [key]: true }));
+        setCopyStatus((prev) => ({ ...prev, [key]: "copied" }));
+        setLiveAnnouncement(`${itemLabel} copied to clipboard.`);
+        setTimeout(() => {
+          setCopiedKeys((prev) => ({ ...prev, [key]: false }));
+          setCopyStatus((prev) => ({ ...prev, [key]: "idle" }));
+        }, 1800);
+      } else {
         setCopiedKeys((prev) => ({ ...prev, [key]: false }));
-      }, 1500);
-    } catch {
-      // Fallback silently if clipboard permissions are restricted
-    }
-  }, []);
+        setCopyStatus((prev) => ({ ...prev, [key]: "error" }));
+        setLiveAnnouncement(
+          `Failed to copy ${itemLabel}. Please select and copy manually.`
+        );
+        setTimeout(() => {
+          setCopyStatus((prev) => ({ ...prev, [key]: "idle" }));
+        }, 2500);
+      }
+    },
+    []
+  );
+
+  const handleDownloadClip = useCallback(
+    async (clip: ClipResult) => {
+      if (!currentJobId) return;
+      const resolvedUrl = resolveVideoUrl(clip.video_url);
+      const fallbackEndpoint = `${getApiBaseUrl()}/api/jobs/${currentJobId}/clips/${clip.clip_id}/download`;
+      const filename = `${currentJobId.slice(0, 8)}_${clip.clip_id}.mp4`;
+
+      setDownloadProgress((prev) => ({ ...prev, [clip.clip_id]: 0 }));
+      setLiveAnnouncement(`Starting download for ${clip.title}`);
+
+      try {
+        await downloadClip(
+          resolvedUrl,
+          filename,
+          fallbackEndpoint,
+          (percent) => {
+            setDownloadProgress((prev) => ({ ...prev, [clip.clip_id]: percent }));
+          }
+        );
+        setLiveAnnouncement(`Download completed for ${clip.title}`);
+      } catch (err) {
+        console.error("Download failed:", err);
+        setLiveAnnouncement(`Download failed for ${clip.title}`);
+      } finally {
+        setTimeout(() => {
+          setDownloadProgress((prev) => {
+            const next = { ...prev };
+            delete next[clip.clip_id];
+            return next;
+          });
+        }, 1200);
+      }
+    },
+    [currentJobId]
+  );
 
   // Keyboard shortcut listener (Cmd/Ctrl + Enter)
   useEffect(() => {
@@ -455,6 +512,16 @@ export default function HomePage() {
 
   return (
     <div className="relative min-h-screen bg-black text-[#EDEDED] antialiased">
+      {/* Screen-reader accessible live announcement region */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        {liveAnnouncement}
+      </div>
+
       {/* Background Architectural Dot Grid */}
       <div className="pointer-events-none fixed inset-0 dot-grid z-0 opacity-80" />
 
@@ -1268,8 +1335,10 @@ export default function HomePage() {
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {jobState.clips.map((clip, idx) => {
                 const resolvedUrl = resolveVideoUrl(clip.video_url);
-                const isCaptionCopied = copiedKeys[`${clip.clip_id}-caption`];
-                const isLinkCopied = copiedKeys[`${clip.clip_id}-link`];
+                const captionStatus = copyStatus[`${clip.clip_id}-caption`];
+                const linkStatus = copyStatus[`${clip.clip_id}-link`];
+                const isDownloading = downloadProgress[clip.clip_id] !== undefined;
+                const dlPercent = downloadProgress[clip.clip_id];
 
                 const captionText = [
                   clip.title,
@@ -1290,6 +1359,10 @@ export default function HomePage() {
                     ? "text-[#888888]"
                     : "text-[#555555]";
 
+                const isHeuristic =
+                  clip.selection_method === "heuristic" || clip.is_fallback;
+                const layoutNote = getLayoutNote(clip, jobState.warnings);
+
                 return (
                   <div
                     key={clip.clip_id}
@@ -1300,24 +1373,50 @@ export default function HomePage() {
                     <div className="px-3 h-9 border-b border-white/[0.08] flex items-center justify-between gap-2 text-xs">
                       <span
                         title={clip.title}
-                        className="truncate font-medium text-[#EDEDED] text-xs max-w-[55%]"
+                        className="truncate font-medium text-[#EDEDED] text-xs max-w-[50%]"
                       >
                         {clip.title}
                       </span>
-                      <div className="flex items-center gap-2 font-mono tabular-nums text-[11px]">
+                      <div className="flex items-center gap-1.5 font-mono tabular-nums text-[11px] shrink-0">
                         <span className="text-[#888888]">
                           {clip.duration}s
                         </span>
-                        <span className="text-[#555555]">·</span>
-                        <span className={scoreColor} title="Virality Score">
-                          {clip.virality_score}/100
-                        </span>
-                        {(clip.selection_method === "heuristic" || clip.is_fallback) && (
+
+                        {/* AI score ONLY shown for LLM selected clips */}
+                        {!isHeuristic ? (
+                          <>
+                            <span className="text-[#555555]">·</span>
+                            <span
+                              className={scoreColor}
+                              title="Predicted Virality Score (0-100)"
+                            >
+                              {clip.virality_score}/100
+                            </span>
+                          </>
+                        ) : (
+                          /* Heuristic label driven by selection_method with tooltip */
                           <span
-                            className="px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wider bg-amber-500/10 text-amber-400 border border-amber-500/20"
-                            title={clip.selection_reason || "Selected via heuristic fallback"}
+                            className="px-1.5 py-0.5 rounded text-[10px] font-mono tracking-wider bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                            title={
+                              clip.selection_reason ||
+                              "Auto-selected via speech heuristics (not AI-ranked)"
+                            }
                           >
-                            Heuristic
+                            Auto-selected (not AI-ranked)
+                          </span>
+                        )}
+
+                        {/* Layout notes from warnings and layout_used */}
+                        {layoutNote && (
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-mono ${
+                              layoutNote.isDegraded
+                                ? "bg-amber-500/10 text-amber-300 border border-amber-500/30"
+                                : "bg-white/[0.06] text-[#888888] border border-white/[0.08]"
+                            }`}
+                            title={layoutNote.tooltip}
+                          >
+                            {layoutNote.label}
                           </span>
                         )}
                       </div>
@@ -1344,13 +1443,50 @@ export default function HomePage() {
                             </p>
                           )}
                         </div>
+                      ) : videoErrors[clip.clip_id] ? (
+                        <div className="text-center space-y-2 font-mono p-4">
+                          <span className="w-8 h-8 rounded-full bg-[#FF4D4D]/10 text-[#FF4D4D] flex items-center justify-center mx-auto text-sm font-bold">
+                            !
+                          </span>
+                          <p className="text-xs text-[#FF4D4D] font-medium">
+                            Playback Error
+                          </p>
+                          <p className="text-[11px] text-[#888888] font-sans">
+                            Failed to stream video or decode byte range.
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setVideoErrors((prev) => ({
+                                ...prev,
+                                [clip.clip_id]: false,
+                              }));
+                              setVideoReloadKey((prev) => ({
+                                ...prev,
+                                [clip.clip_id]: (prev[clip.clip_id] || 0) + 1,
+                              }));
+                            }}
+                            className="mt-2 h-7 px-3 rounded text-xs font-mono text-white bg-white/[0.1] hover:bg-white/[0.2] border border-white/[0.15] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+                          >
+                            Retry Playback
+                          </button>
+                        </div>
                       ) : (
                         <video
+                          key={`${clip.clip_id}-${
+                            videoReloadKey[clip.clip_id] || 0
+                          }`}
                           src={resolvedUrl}
                           controls
                           playsInline
                           preload="metadata"
                           className="w-full h-full object-contain bg-black"
+                          onError={() => {
+                            setVideoErrors((prev) => ({
+                              ...prev,
+                              [clip.clip_id]: true,
+                            }));
+                          }}
                         />
                       )}
                     </div>
@@ -1386,45 +1522,90 @@ export default function HomePage() {
                             <button
                               type="button"
                               onClick={() =>
-                                handleCopy(`${clip.clip_id}-caption`, captionText)
+                                handleCopy(
+                                  `${clip.clip_id}-caption`,
+                                  captionText,
+                                  `Caption for ${clip.title}`
+                                )
                               }
+                              aria-label={`Copy caption and hashtags for ${clip.title}`}
                               title="Copy title, description, and hashtags"
-                              className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors"
+                              className={`text-[11px] font-mono px-2 py-1 rounded transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40 ${
+                                captionStatus === "copied"
+                                  ? "text-[#50E3C2] bg-[#50E3C2]/10"
+                                  : captionStatus === "error"
+                                  ? "text-[#FF4D4D] bg-[#FF4D4D]/10"
+                                  : "text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111]"
+                              }`}
                             >
-                              {isCaptionCopied ? "Copied" : "Copy Caption"}
+                              {captionStatus === "copied"
+                                ? "Copied"
+                                : captionStatus === "error"
+                                ? "Copy Failed"
+                                : "Copy Caption"}
                             </button>
 
                             <button
                               type="button"
                               onClick={() =>
-                                handleCopy(`${clip.clip_id}-link`, resolvedUrl)
+                                handleCopy(
+                                  `${clip.clip_id}-link`,
+                                  resolvedUrl,
+                                  `Video URL for ${clip.title}`
+                                )
                               }
-                              className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors"
+                              aria-label={`Copy video URL for ${clip.title}`}
+                              title="Copy direct video URL"
+                              className={`text-[11px] font-mono px-2 py-1 rounded transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40 ${
+                                linkStatus === "copied"
+                                  ? "text-[#50E3C2] bg-[#50E3C2]/10"
+                                  : linkStatus === "error"
+                                  ? "text-[#FF4D4D] bg-[#FF4D4D]/10"
+                                  : "text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111]"
+                              }`}
                             >
-                              {isLinkCopied ? "Copied" : "Copy Link"}
+                              {linkStatus === "copied"
+                                ? "Copied"
+                                : linkStatus === "error"
+                                ? "Copy Failed"
+                                : "Copy Link"}
                             </button>
                           </div>
 
-                          <a
-                            href={resolvedUrl}
-                            download={`${clip.clip_id}.mp4`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors flex items-center gap-1"
+                          <button
+                            type="button"
+                            onClick={() => handleDownloadClip(clip)}
+                            aria-label={`Download video clip for ${clip.title}`}
+                            disabled={isDownloading}
+                            className="text-[11px] font-mono text-[#888888] hover:text-[#EDEDED] hover:bg-[#111111] px-2 py-1 rounded transition-colors flex items-center gap-1 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40 disabled:opacity-60"
                           >
-                            <span>Download</span>
-                            <svg
-                              className="w-3 h-3"
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="1.8"
-                            >
-                              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                              <polyline points="7 10 12 15 17 10" />
-                              <line x1="12" y1="15" x2="12" y2="3" />
-                            </svg>
-                          </a>
+                            {isDownloading ? (
+                              <>
+                                <span className="w-2.5 h-2.5 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                                <span>
+                                  {typeof dlPercent === "number" && dlPercent > 0
+                                    ? `${dlPercent}%`
+                                    : "Downloading…"}
+                                </span>
+                              </>
+                            ) : (
+                              <>
+                                <span>Download</span>
+                                <svg
+                                  className="w-3 h-3"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="1.8"
+                                  aria-hidden="true"
+                                >
+                                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                  <polyline points="7 10 12 15 17 10" />
+                                  <line x1="12" y1="15" x2="12" y2="3" />
+                                </svg>
+                              </>
+                            )}
+                          </button>
                         </>
                       )}
                     </div>

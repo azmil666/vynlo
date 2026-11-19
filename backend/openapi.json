@@ -650,6 +650,53 @@
         "summary": "Get Job Status"
       }
     },
+    "/api/jobs/{job_id}/clips/{clip_id}/download": {
+      "get": {
+        "description": "Download an individual rendered clip with Content-Disposition: attachment header.\n\nGuarantees cross-origin compatible file downloading without relying on <a download>.",
+        "operationId": "download_single_clip_api_jobs__job_id__clips__clip_id__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "clip_id",
+            "required": true,
+            "schema": {
+              "title": "Clip Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Single Clip"
+      }
+    },
     "/api/jobs/{job_id}/download-all": {
       "get": {
         "description": "Bundle all generated clips and captions into a single zip archive for batch download.\n\nLow-memory, non-blocking streaming export:\n- Built into a SpooledTemporaryFile with strictly bounded memory footprint.\n- Uses ZIP_STORED for MP4 video entries and ZIP_DEFLATED for manifest.\n- Remote clips are fetched with timeouts and size limits in a threadpool without blocking the event loop.\n- Handles missing or expired files per clip with manifest notes rather than aborting.\n- Streams the zip response with Content-Disposition attachment header.",

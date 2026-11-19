@@ -3,6 +3,7 @@
  */
 
 import type {
+  ClipResult,
   JobErrorDetail,
   JobStatusResponse,
   JobWarning,
@@ -305,4 +306,180 @@ export function calculatePollingBackoff(
   if (consecutiveFailures <= 0) return baseIntervalMs;
   const factor = Math.pow(1.5, Math.min(consecutiveFailures, 5));
   return Math.min(maxIntervalMs, Math.round(baseIntervalMs * factor));
+}
+
+/**
+ * Copy text to clipboard with modern Clipboard API and fallback to execCommand.
+ * Returns true if copy succeeded, false on error.
+ */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+
+  // 1. Try modern async Clipboard API if available and permitted
+  if (
+    navigator.clipboard &&
+    typeof navigator.clipboard.writeText === "function"
+  ) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // If permission denied or restricted, fall through to fallback
+    }
+  }
+
+  // 2. Fallback using temporary off-screen textarea with execCommand
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    // Position fixed and off-screen to avoid scroll jumping on iOS/Safari
+    textarea.style.position = "fixed";
+    textarea.style.top = "0";
+    textarea.style.left = "-9999px";
+    textarea.style.opacity = "0";
+    textarea.setAttribute("readonly", "");
+    document.body.appendChild(textarea);
+
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, text.length);
+
+    const successful = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return Boolean(successful);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Download a clip file handling cross-origin restrictions.
+ * Fetches as a local Blob or falls back to backend Content-Disposition attachment endpoint.
+ */
+export async function downloadClip(
+  videoUrl: string,
+  filename: string,
+  fallbackEndpoint?: string,
+  onProgress?: (percent: number) => void
+): Promise<void> {
+  if (typeof window === "undefined") return;
+
+  try {
+    const res = await fetch(videoUrl, { mode: "cors" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const contentLength = Number(res.headers.get("content-length")) || 0;
+    let blob: Blob;
+
+    if (res.body && contentLength > 0 && onProgress) {
+      const reader = res.body.getReader();
+      let receivedBytes = 0;
+      const chunks: BlobPart[] = [];
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          receivedBytes += value.length;
+          onProgress(
+            Math.min(99, Math.round((receivedBytes / contentLength) * 100))
+          );
+        }
+      }
+      blob = new Blob(chunks, { type: "video/mp4" });
+      onProgress(100);
+    } else {
+      blob = await res.blob();
+      if (onProgress) onProgress(100);
+    }
+
+    const blobUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = blobUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+  } catch (err) {
+    // If CORS or blob fetch fails, use backend Content-Disposition endpoint
+    if (fallbackEndpoint) {
+      const link = document.createElement("a");
+      link.href = fallbackEndpoint;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      return;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Extract human-readable layout and framing notes from clip metadata and warnings.
+ */
+export function getLayoutNote(
+  clip: ClipResult,
+  jobWarnings?: JobWarning[]
+): { label: string; tooltip?: string; isDegraded: boolean } | null {
+  const warnings = clip.warnings || [];
+  const warningTexts = warnings.map((w) =>
+    typeof w === "string" ? w : w.message
+  );
+
+  // Check job warnings matching clip_index
+  if (jobWarnings) {
+    for (const jw of jobWarnings) {
+      if (jw.clip_index !== null && jw.clip_index !== undefined) {
+        warningTexts.push(jw.message);
+      }
+    }
+  }
+
+  // 1. Check for no-face / full-frame degradation
+  const hasNoFace = warningTexts.some(
+    (t) =>
+      t.toLowerCase().includes("no face") ||
+      t.toLowerCase().includes("full-frame") ||
+      t.includes("NO_FACE_DETECTED")
+  );
+  if (hasNoFace) {
+    return {
+      label: "Full-frame (no face)",
+      tooltip:
+        "No human face was detected; framed as full-frame 9:16 instead of auto-tracking.",
+      isDegraded: true,
+    };
+  }
+
+  // 2. Check for fit_blur layout
+  if (clip.layout_used === "fit_blur") {
+    return {
+      label: "Fit-blur",
+      tooltip: "Rendered with padded blurred background.",
+      isDegraded: false,
+    };
+  }
+
+  // 3. Check for split layout
+  if (clip.layout_used === "split") {
+    return {
+      label: "Split layout",
+      tooltip: "Top webcam face pinned over bottom gameplay / screen pane.",
+      isDegraded: false,
+    };
+  }
+
+  // 4. Default speaker tracked layout
+  if (clip.layout_used === "speaker") {
+    return {
+      label: "Speaker tracked",
+      tooltip: "Smart 9:16 speaker tracking crop centered on detected face.",
+      isDegraded: false,
+    };
+  }
+
+  return null;
 }

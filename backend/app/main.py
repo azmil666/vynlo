@@ -11,7 +11,7 @@ import zipfile
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import redis
 
@@ -290,6 +290,62 @@ async def download_all_clips(job_id: str):
             "Cache-Control": "no-cache",
         },
     )
+
+
+@app.get("/api/jobs/{job_id}/clips/{clip_id}/download")
+async def download_single_clip(job_id: str, clip_id: str):
+    """Download an individual rendered clip with Content-Disposition: attachment header.
+
+    Guarantees cross-origin compatible file downloading without relying on <a download>.
+    """
+    job_status = get_job_status(job_id)
+    if job_status.status == "expired":
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Job clips have expired and are no longer available",
+        )
+
+    # Locate clip by clip_id or 1-based index
+    target_clip = None
+    clip_index = -1
+    for idx, c in enumerate(job_status.clips):
+        if c.clip_id == clip_id or str(idx + 1) == clip_id:
+            target_clip = c
+            clip_index = idx + 1
+            break
+
+    if not target_clip:
+        raise HTTPException(status_code=404, detail="Clip not found in job")
+
+    safe_clip_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", target_clip.clip_id)
+    filename = f"{job_id[:8]}_{safe_clip_id}.mp4"
+
+    # Local file path check
+    local_path = os.path.join(settings.STATIC_DIR, job_id, f"clip_{clip_index}.mp4")
+    if os.path.exists(local_path):
+        return FileResponse(
+            path=local_path,
+            media_type="video/mp4",
+            filename=filename,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
+    # Remote URL (S3 / R2 / presigned URL) streaming with attachment header
+    if target_clip.video_url and (target_clip.video_url.startswith("http://") or target_clip.video_url.startswith("https://")):
+        from app.services.export import fetch_remote_clip_stream
+        return StreamingResponse(
+            fetch_remote_clip_stream(target_clip.video_url),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    raise HTTPException(status_code=404, detail="Clip file not available")
 
 
 @app.get("/health")
