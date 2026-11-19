@@ -24,7 +24,12 @@ from app.schemas import (
     PipelineErrorCode,
     map_exception_to_pipeline_error,
 )
-from app.services.downloader import download_media, get_video_metadata
+from app.services.downloader import (
+    download_media,
+    extract_audio_from_video,
+    get_video_metadata,
+)
+from app.services.metrics import PipelineMetricsTracker
 from app.services.transcriber import transcribe_audio
 from app.services.analyzer import find_viral_clips
 from app.services.cropper import (
@@ -166,12 +171,15 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             )
             return
 
+    tracker = PipelineMetricsTracker(job_id=job_id)
+
     def update_job_state(
         stage: str,
         progress: int,
         clips: list[dict] | None = None,
         error: Any | None = None,
         warnings: list[dict] | None = None,
+        metrics: dict[str, Any] | None = None,
     ) -> None:
         nonlocal current_stage
         current_stage = stage
@@ -184,6 +192,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
         current_clips: list[dict] = []
         current_error: Any = None
         current_warnings: list[dict] = []
+        current_metrics: Any = None
         existing_status_raw = r_conn.get(j_key)
         if existing_status_raw:
             try:
@@ -191,11 +200,15 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 current_clips = existing_data.get("clips", [])
                 current_error = existing_data.get("error")
                 current_warnings = existing_data.get("warnings", [])
+                current_metrics = existing_data.get("metrics")
             except Exception:
                 pass
 
         active_warnings = (
             warnings if warnings is not None else (warnings_list or current_warnings)
+        )
+        active_metrics = (
+            metrics if metrics is not None else (tracker.to_dict() if tracker else current_metrics)
         )
 
         state = JobStatusResponse(
@@ -207,6 +220,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             error=error if error is not None else current_error,
             warnings=active_warnings,
             clips=clips if clips is not None else current_clips,
+            metrics=active_metrics,
         )
         r_conn.set(j_key, state.model_dump_json(), ex=ttl)
 
@@ -219,32 +233,33 @@ def process_video_task(self, job_id: str, options: dict) -> None:
 
         # 1. Resolve video_id via metadata with restricted fallback
         meta_duration: Optional[float] = None
-        try:
-            meta = get_video_metadata(url)
-            video_id = meta["video_id"]
-            meta_duration = meta.get("duration")
-            if meta_duration is None:
+        with tracker.stage("metadata"):
+            try:
+                meta = get_video_metadata(url)
+                video_id = meta["video_id"]
+                meta_duration = meta.get("duration")
+                if meta_duration is None:
+                    warnings_list.append({
+                        "code": "MISSING_METADATA_DURATION",
+                        "message": "Video metadata did not specify duration; duration limits will be enforced via ffprobe.",
+                    })
+            except PipelineError:
+                # Re-raise classified pipeline errors immediately (no silent continuation)
+                raise
+            except Exception as e:
+                # Only for non-classified generic errors on direct media URLs: record warning,
+                # use URL-hash ID, and post-download validation will strictly enforce ffprobe duration.
+                logger.warning(
+                    "Metadata extraction failed for %s: %s. Using URL hash fallback and enforcing duration post-download.",
+                    url,
+                    e,
+                )
                 warnings_list.append({
-                    "code": "MISSING_METADATA_DURATION",
-                    "message": "Video metadata did not specify duration; duration limits will be enforced via ffprobe.",
+                    "code": "METADATA_FALLBACK_HASHED_ID",
+                    "message": "Metadata extraction unavailable; using hashed URL id and enforcing duration via ffprobe.",
                 })
-        except PipelineError:
-            # Re-raise classified pipeline errors immediately (no silent continuation)
-            raise
-        except Exception as e:
-            # Only for non-classified generic errors on direct media URLs: record warning,
-            # use URL-hash ID, and post-download validation will strictly enforce ffprobe duration.
-            logger.warning(
-                "Metadata extraction failed for %s: %s. Using URL hash fallback and enforcing duration post-download.",
-                url,
-                e,
-            )
-            warnings_list.append({
-                "code": "METADATA_FALLBACK_HASHED_ID",
-                "message": "Metadata extraction unavailable; using hashed URL id and enforcing duration via ffprobe.",
-            })
-            url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-            video_id = f"url:{url_hash}"
+                url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+                video_id = f"url:{url_hash}"
 
         r = get_redis_client()
 
@@ -254,12 +269,13 @@ def process_video_task(self, job_id: str, options: dict) -> None:
 
         # 3. Download media: skip audio extraction if transcript is already cached
         update_job_state("downloading", 10)
-        video_path, audio_path, source_info, dl_warnings = download_media(
-            url,
-            work_dir,
-            extract_audio=(not has_cached_transcript),
-            meta_duration=meta_duration,
-        )
+        with tracker.stage("download"):
+            video_path, audio_path, source_info, dl_warnings = download_media(
+                url,
+                work_dir,
+                extract_audio=(not has_cached_transcript),
+                meta_duration=meta_duration,
+            )
         warnings_list.extend(dl_warnings)
 
         # 4. Transcribe or load cached transcript (with freshly probed duration validation)
@@ -295,28 +311,14 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 try:
                     if not audio_path:
                         audio_path = os.path.join(work_dir, "audio.wav")
-                        cmd = [
-                            "ffmpeg",
-                            "-y",
-                            "-i",
-                            video_path,
-                            "-vn",
-                            "-acodec",
-                            "pcm_s16le",
-                            "-ar",
-                            "16000",
-                            "-ac",
-                            "1",
+                        with tracker.stage("audio_extract"):
+                            extract_audio_from_video(video_path, audio_path)
+                    with tracker.stage("transcribe"):
+                        words = transcribe_audio(
                             audio_path,
-                        ]
-                        subprocess.run(
-                            cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                            timeline_offset=source_info.timeline_offset if source_info else 0.0,
+                            media_duration=source_info.duration if source_info else None,
                         )
-                    words = transcribe_audio(
-                        audio_path,
-                        timeline_offset=source_info.timeline_offset if source_info else 0.0,
-                        media_duration=source_info.duration if source_info else None,
-                    )
                     validation_dict = (
                         words.validation.model_dump()
                         if hasattr(words, "validation") and hasattr(words.validation, "model_dump")
@@ -353,10 +355,11 @@ def process_video_task(self, job_id: str, options: dict) -> None:
 
             if not cache_hit:
                 try:
-                    superset_target = max(max_clips, settings.ANALYSIS_SUPERSET_SIZE)
-                    all_candidates = find_viral_clips(words, max_clips=superset_target)
-                    set_cached_candidates(r, video_id, words, all_candidates)
-                    candidates = all_candidates[:max_clips]
+                    with tracker.stage("analyze"):
+                        superset_target = max(max_clips, settings.ANALYSIS_SUPERSET_SIZE)
+                        all_candidates = find_viral_clips(words, max_clips=superset_target)
+                        set_cached_candidates(r, video_id, words, all_candidates)
+                        candidates = all_candidates[:max_clips]
                 finally:
                     if lock_acquired:
                         release_single_flight_lock(r, f"analysis:{video_id}", worker_task_id)
@@ -450,15 +453,16 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             clip_coverage = None
 
             try:
-                crop_filter = compute_crop_filter(
-                    video_path,
-                    clip["start_time"],
-                    clip["end_time"],
-                    mode=layout_mode,
-                    source_info=source_info,
-                    words=words,
-                    webcam_region=options.get("webcam_region"),
-                )
+                with tracker.stage("face_detection", clip_index=i):
+                    crop_filter = compute_crop_filter(
+                        video_path,
+                        clip["start_time"],
+                        clip["end_time"],
+                        mode=layout_mode,
+                        source_info=source_info,
+                        words=words,
+                        webcam_region=options.get("webcam_region"),
+                    )
                 actual_layout = getattr(crop_filter, "layout_used", layout_mode)
                 clip_coverage = getattr(crop_filter, "coverage", None)
 
@@ -497,30 +501,32 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                     warnings_list.append(warn_obj)
                     clip_warnings.append(f"{warn_code}: {cw}")
 
-                generate_ass_subtitles(
-                    words,
-                    clip["start_time"],
-                    clip["end_time"],
-                    ass_path,
-                    preset=options.get("caption_preset", "clean_white"),
-                    safe_zone=options.get("platform_safe_zone", "shorts"),
-                    highlight_color=options.get("highlight_color", "&H00FFFFFF"),
-                    hook_title=clip.get("title"),
-                    show_hook_banner=options.get("show_hook_banner", True),
-                    layout=actual_layout,
-                    warnings=warnings_list,
-                )
+                with tracker.stage("render", clip_index=i):
+                    generate_ass_subtitles(
+                        words,
+                        clip["start_time"],
+                        clip["end_time"],
+                        ass_path,
+                        preset=options.get("caption_preset", "clean_white"),
+                        safe_zone=options.get("platform_safe_zone", "shorts"),
+                        highlight_color=options.get("highlight_color", "&H00FFFFFF"),
+                        hook_title=clip.get("title"),
+                        show_hook_banner=options.get("show_hook_banner", True),
+                        layout=actual_layout,
+                        warnings=warnings_list,
+                    )
 
-                render_clip_single_pass(
-                    video_path=video_path,
-                    start_time=clip["start_time"],
-                    end_time=clip["end_time"],
-                    crop_filter=crop_filter,
-                    ass_path=ass_path,
-                    output_path=final_clip_path,
-                )
+                    render_clip_single_pass(
+                        video_path=video_path,
+                        start_time=clip["start_time"],
+                        end_time=clip["end_time"],
+                        crop_filter=crop_filter,
+                        ass_path=ass_path,
+                        output_path=final_clip_path,
+                    )
 
-                public_url = upload_clip(final_clip_path, upload_key)
+                with tracker.stage("upload", clip_index=i):
+                    public_url = upload_clip(final_clip_path, upload_key)
 
                 if is_fb:
                     fb_warn = JobWarning(
@@ -609,6 +615,7 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             )
 
         # Determine final job completion status
+        tracker.log_metrics(logger, job_id=job_id)
         successful_count = sum(1 for c in completed_clips if c.get("ok", False) or c.get("render_ok", False))
         total_count = len(completed_clips)
 
@@ -628,7 +635,14 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 stage="rendering",
                 detail=first_err,
             )
-            update_job_state("failed", 100, clips=completed_clips, error=fail_detail, warnings=warnings_list)
+            update_job_state(
+                "failed",
+                100,
+                clips=completed_clips,
+                error=fail_detail,
+                warnings=warnings_list,
+                metrics=tracker.to_dict(),
+            )
         elif successful_count < total_count:
             logger.warning(
                 "Job %s completed with warnings (partial delivery): %d/%d clips succeeded.",
@@ -636,9 +650,21 @@ def process_video_task(self, job_id: str, options: dict) -> None:
                 successful_count,
                 total_count,
             )
-            update_job_state("completed_with_warnings", 100, clips=completed_clips, warnings=warnings_list)
+            update_job_state(
+                "completed_with_warnings",
+                100,
+                clips=completed_clips,
+                warnings=warnings_list,
+                metrics=tracker.to_dict(),
+            )
         else:
-            update_job_state("completed", 100, clips=completed_clips, warnings=warnings_list)
+            update_job_state(
+                "completed",
+                100,
+                clips=completed_clips,
+                warnings=warnings_list,
+                metrics=tracker.to_dict(),
+            )
 
     except Retry:
         raise
@@ -647,6 +673,11 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             "Job %s exceeded soft time limit of %ds",
             job_id,
             settings.task_soft_time_limit,
+        )
+        tracker.log_metrics(
+            logger,
+            job_id=job_id,
+            extra={"error": str(e), "error_code": PipelineErrorCode.TIMEOUT.value},
         )
         timeout_err = JobErrorDetail(
             code=PipelineErrorCode.TIMEOUT.value,
@@ -660,10 +691,16 @@ def process_video_task(self, job_id: str, options: dict) -> None:
             progress=0,
             error=timeout_err,
             warnings=warnings_list,
+            metrics=tracker.to_dict(),
         )
         raise
     except Exception as e:
         pipeline_err = map_exception_to_pipeline_error(e, current_stage=current_stage)
+        tracker.log_metrics(
+            logger,
+            job_id=job_id,
+            extra={"error": str(e), "error_code": pipeline_err.code.value},
+        )
         logger.exception(
             "Task failed for job %s at stage '%s' [%s]: %s",
             job_id,

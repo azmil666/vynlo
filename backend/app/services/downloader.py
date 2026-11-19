@@ -1,6 +1,9 @@
+import hashlib
 import json
 import logging
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import time
 from typing import Any, Optional
@@ -9,6 +12,7 @@ import yt_dlp
 
 from app.config import settings
 from app.schemas import PipelineError, PipelineErrorCode, SourceInfo
+from app.services.metrics import get_current_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +147,42 @@ def get_video_metadata(url: str, max_retries: int = 2) -> dict:
 
     Retries transient errors with capped backoff. Rejects live/upcoming streams.
     Handles missing duration gracefully for post-download validation.
+    Supports local video file fixtures (paths starting with file:// or existing locally).
     """
+    local_path = url[7:] if url.startswith("file://") else url
+    if os.path.isfile(local_path):
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            local_path,
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
+            probe_data = json.loads(res.stdout)
+            format_duration = float(probe_data.get("format", {}).get("duration", 0) or 0)
+            v_stream = next((s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"), {})
+            v_duration = float(v_stream.get("duration", 0) or 0)
+            duration = format_duration or v_duration or None
+            file_hash = hashlib.sha256(local_path.encode()).hexdigest()[:12]
+            title = Path(local_path).stem
+            return {
+                "video_id": f"local:{file_hash}",
+                "duration": duration,
+                "title": title,
+            }
+        except Exception as e:
+            raise PipelineError(
+                code=PipelineErrorCode.UNSUPPORTED_FORMAT,
+                stage="downloading",
+                user_message=f"Failed to inspect local media fixture: {e}",
+                retryable=False,
+            )
+
     ydl_opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -436,6 +475,27 @@ def validate_downloaded_media(
     return source_info, warnings
 
 
+def extract_audio_from_video(video_path: str, audio_path: str) -> None:
+    """Extract 16kHz mono PCM WAV audio from video file for transcription."""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        video_path,
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        audio_path,
+    ]
+    subprocess.run(
+        cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+
 def download_media(
     url: str,
     output_dir: str,
@@ -447,46 +507,52 @@ def download_media(
 
     Enforces format selection (avc1 preference, height cap, no unconditional fallback), retries
     transient network errors, and runs post-download validation via ffprobe.
+    Supports local file fixtures directly without network invocation.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     video_path = os.path.join(output_dir, "source.mp4")
     audio_path = os.path.join(output_dir, "audio.wav") if extract_audio else None
 
-    format_str = get_format_selector(meta_duration=meta_duration)
+    local_path = url[7:] if url.startswith("file://") else url
+    if os.path.isfile(local_path):
+        if os.path.abspath(local_path) != os.path.abspath(video_path):
+            shutil.copy2(local_path, video_path)
+    else:
+        format_str = get_format_selector(meta_duration=meta_duration)
 
-    ydl_opts: dict[str, Any] = {
-        "format": format_str,
-        "outtmpl": os.path.join(output_dir, "source.%(ext)s"),
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
+        ydl_opts: dict[str, Any] = {
+            "format": format_str,
+            "outtmpl": os.path.join(output_dir, "source.%(ext)s"),
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+        }
 
-    if settings.YTDLP_COOKIES_PATH and os.path.exists(settings.YTDLP_COOKIES_PATH):
-        ydl_opts["cookiefile"] = settings.YTDLP_COOKIES_PATH
+        if settings.YTDLP_COOKIES_PATH and os.path.exists(settings.YTDLP_COOKIES_PATH):
+            ydl_opts["cookiefile"] = settings.YTDLP_COOKIES_PATH
 
-    for attempt in range(max_retries + 1):
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-            break
-        except Exception as e:
-            err = classify_ytdlp_error(e, url)
-            if err.retryable and attempt < max_retries:
-                backoff = min(5.0, 1.0 * (2 ** attempt))
-                logger.warning(
-                    "Transient error downloading %s (attempt %d/%d). Retrying in %.1fs: %s",
-                    url,
-                    attempt + 1,
-                    max_retries,
-                    backoff,
-                    err.user_message,
-                )
-                time.sleep(backoff)
-                continue
-            raise err
+        for attempt in range(max_retries + 1):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                break
+            except Exception as e:
+                err = classify_ytdlp_error(e, url)
+                if err.retryable and attempt < max_retries:
+                    backoff = min(5.0, 1.0 * (2 ** attempt))
+                    logger.warning(
+                        "Transient error downloading %s (attempt %d/%d). Retrying in %.1fs: %s",
+                        url,
+                        attempt + 1,
+                        max_retries,
+                        backoff,
+                        err.user_message,
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise err
 
     if not os.path.exists(video_path):
         candidates = [
@@ -511,22 +577,11 @@ def download_media(
     source_info, warnings = validate_downloaded_media(video_path, meta_duration=meta_duration)
 
     if extract_audio and audio_path:
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            video_path,
-            "-vn",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            audio_path,
-        ]
-        subprocess.run(
-            cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        tracker = get_current_tracker()
+        if tracker:
+            with tracker.stage("audio_extract"):
+                extract_audio_from_video(video_path, audio_path)
+        else:
+            extract_audio_from_video(video_path, audio_path)
 
     return video_path, audio_path, source_info, warnings

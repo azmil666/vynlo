@@ -639,13 +639,15 @@ def classify_llm_error(exc: Exception) -> PipelineError:
             detail=msg,
         )
 
-    # Transient / Rate Limits / 5xx / Timeouts
+    # Transient / Rate Limits / 5xx / Timeouts / Network Connect Errors
     is_transient = (
         isinstance(exc, (ConnectionError, TimeoutError))
+        or "connect" in exc.__class__.__name__.lower()
         or any(k in msg_lower for k in [
             "429", "too many requests", "rate limit", "resource exhausted",
             "quota", "500", "502", "503", "504", "server error",
             "timeout", "timed out", "deadline", "connection error",
+            "nodename nor servname", "network", "getaddrinfo",
         ])
     )
     if is_transient:

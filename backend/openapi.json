@@ -359,6 +359,19 @@
             "title": "Job Id",
             "type": "string"
           },
+          "metrics": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Internal stage execution timings and resource metrics.",
+            "title": "Metrics"
+          },
           "progress": {
             "default": 0,
             "description": "Overall pipeline completion percentage (0-100).",

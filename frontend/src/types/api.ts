@@ -166,6 +166,8 @@ export interface JobStatusResponse {
   clips: ClipResult[];
   /** Flag indicating if the job partially succeeded with warnings. */
   is_partial?: boolean;
+  /** Internal stage execution timings and resource metrics. */
+  metrics?: Record<string, unknown> | null;
 }
 
 export interface ValidationError {

@@ -248,6 +248,7 @@ class JobStatusResponse(BaseModel):
     warnings: list[JobWarning] = Field(default_factory=list, description="Non-fatal warnings recorded during pipeline execution.")
     clips: list[ClipResult] = Field(default_factory=list, description="List of generated clip results and their delivery metadata.")
     is_partial: bool = Field(default=False, description="Flag indicating if the job partially succeeded with warnings.")
+    metrics: Optional[dict[str, Any]] = Field(default=None, description="Internal stage execution timings and resource metrics.")
 
     @model_validator(mode="before")
     @classmethod
